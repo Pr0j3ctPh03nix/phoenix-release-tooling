@@ -23,18 +23,20 @@ hand-typed there.
 Structural consequences worth spelling out, because each one replaces a rule
 tools/validate_manifest.py used to check AFTER the fact:
 
-  * `Bundle(...)` refuses to construct empty (B7), with a zero-size member (B6), with a member
-    already in another bundle (B5), or with a member that is also a named/loose entry -- an entry is
-    one or the other, never both, and Bundle is the only thing that ever sets that.
+  * `Bundle(...)` refuses to construct empty (B7), with a zero-size member (B6), with the same
+    OBJECT already in another bundle, or with a member that is also a named/loose entry -- an entry
+    is one or the other, never both, and Bundle is the only thing that ever sets that.
   * `bundles[].size`/`.members` are Derived (manifest_schema.py) from the entries a Bundle actually
     holds, so they can never disagree with what is really inside it (B2, and half of B1).
   * `Choice(...)` refuses a `default` that is not one of its own `variants` (structural, not a typo
     waiting to happen).
-  * `build()` itself closes the two gaps no single object's constructor can see, because they are
+  * `build()` itself closes the gaps no single object's constructor can see, because they are
     properties of the WHOLE document assembled together: every entry with a positive size is either
-    named or bundled (B3), every bundle's members are all reachable from `files[]` or an option
-    (the rest of B1), no two bundles share a name (B8), and every tree reference resolves to one of
-    the manifest's own top-level entries.
+    named or bundled (B3); every bundle's members are all reachable from `files[]` or an option (the
+    rest of B1); no two bundles share a name (B8); no sha256 is claimed by two bundle slots even via
+    two DIFFERENT objects that happen to carry the same hash (the rest of B5 -- Bundle's own check is
+    by object identity and cannot see that case); and every tree reference resolves to one of the
+    manifest's own top-level entries.
   * `schema` is Derived: 3 the instant any bundle exists, 2 otherwise. No caller ever sets it.
 
 B4 -- "nothing between members, nothing after the last" -- has no producer-side equivalent; it is a
@@ -193,11 +195,20 @@ def _check_unbundled(entries, options):
 
 
 def _check_bundles(entries, bundles, options):
-    """B8 (no two bundles share a name) and the other half of B1 (a bundle can only pack an asset
-    that is actually reachable from `files[]` or an option -- otherwise its dest is unrecoverable,
-    even though manifest_schema.BUNDLE guarantees its `members` entry is never a stray hash)."""
+    """B8 (no two bundles share a name), the other half of B1 (a bundle can only pack an asset that
+    is actually reachable from `files[]` or an option -- otherwise its dest is unrecoverable, even
+    though manifest_schema.BUNDLE guarantees its `members` entry is never a stray hash), and B5.
+
+    B5 is checked by HASH here, not left to Bundle.__init__'s per-OBJECT `_bundle` tracking, because
+    that tracking alone misses two shapes: the identical Entry object listed twice in one bundle's
+    own `entries` (each check in that loop runs before either assignment lands), and two DISTINCT
+    Entry/Variant objects that legitimately carry the same sha256 -- identical bytes at two
+    different dests, or a variant and a raw file sharing content -- placed in two different bundles.
+    Both produce a document with one hash claimed by two bundle slots, which is exactly what B5
+    forbids; only a scan over every member's sha256, once every bundle is known, catches both."""
     pool = _asset_pool(entries, options)
     names = set()
+    seen_hashes = set()
     for b in bundles:
         if b.name in names:
             raise ValueError(f"duplicate bundle asset name {b.name!r} (B8)")
@@ -206,6 +217,10 @@ def _check_bundles(entries, bundles, options):
             if e not in pool:
                 raise ValueError(f"bundle {b.name!r} packs an entry absent from files[] and every "
                                  "option -- its dest would be unrecoverable (B1)")
+            if e.sha256 in seen_hashes:
+                raise ValueError(f"sha256 {e.sha256[:12]} claimed by more than one bundle slot, "
+                                 f"via bundle {b.name!r} (B5 -- one hash, one bundle)")
+            seen_hashes.add(e.sha256)
 
 
 def _check_tree(tree, entries):
@@ -468,10 +483,18 @@ def _selftest():
         e = entry("game/dota/a.bin", sha("a"), 10, name="a.bin")
         build("mod", "1.0.0", schema.SERIAL_FLOOR - 1, [e])
 
+    def serial_is_bool():
+        # Python's bool is an int subclass (True == 1), so a floor/type check that only compares
+        # VALUE would silently accept this -- the same trap tools/validate_manifest.py named
+        # explicitly for `schema`/`serial`. Int.render() checks isinstance(..., bool) first.
+        e = entry("game/dota/a.bin", sha("a"), 10, name="a.bin")
+        build("mod", "1.0.0", True, [e])
+
     refused("a malformed sha256", bad_sha)
     refused("a payload_id outside the closed set", bad_payload_id)
     refused("a codec this format does not define", bad_codec)
     refused("a serial below SERIAL_FLOOR", serial_below_floor)
+    refused("a serial that is `True` rather than an int", serial_is_bool)
 
     # --- 5. bundle membership is single, and a bundle cannot be empty --------------------------
 
@@ -483,8 +506,28 @@ def _selftest():
     def empty_bundle():
         Bundle("b-empty.phxb", "zstd", 0, sha("p"), entries=[])
 
+    def entry_twice_in_one_bundle():
+        # Bundle.__init__'s per-object `_bundle` check cannot see this: both occurrences are
+        # inspected before either assignment lands. Only build()'s hash scan catches it.
+        e = entry("game/dota/a.bin", sha("a"), 10)
+        b = Bundle("b-dup.phxb", "zstd", 5, sha("p"), entries=[e, e])
+        build("mod", "1.0.0", schema.SERIAL_FLOOR, [e], bundles=[b])
+
+    def duplicate_hash_across_bundles():
+        # Two DISTINCT objects -- identical content at two different dests is legal -- each placed
+        # in a different bundle. Bundle.__init__ tracks membership by object identity and cannot see
+        # that these are the same hash; only build()'s hash scan does.
+        e1 = entry("game/dota/a.bin", sha("dup"), 10)
+        e2 = entry("game/dota/b.bin", sha("dup"), 10)
+        b1 = Bundle("b-1.phxb", "zstd", 5, sha("p1"), entries=[e1])
+        b2 = Bundle("b-2.phxb", "zstd", 5, sha("p2"), entries=[e2])
+        build("mod", "1.0.0", schema.SERIAL_FLOOR, [e1, e2], bundles=[b1, b2])
+
     refused("the same entry placed in two bundles", entry_in_two_bundles)
     refused("a bundle with no entries", empty_bundle)
+    refused("the same entry object listed twice in one bundle's own entries", entry_twice_in_one_bundle)
+    refused("two different entries sharing one sha256, in two different bundles",
+            duplicate_hash_across_bundles)
 
     # --- 6. a one-entry launcher-shaped document builds, and derives schema 2 ------------------
 
