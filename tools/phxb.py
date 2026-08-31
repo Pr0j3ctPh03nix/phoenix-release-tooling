@@ -3,7 +3,9 @@
 A bundle is CONTAINERLESS: `zstd(member₀ ‖ member₁ ‖ …)` with no header, no member table and no
 padding. Everything needed to take it apart lives in the manifest (each member's `sha256`, `size`
 and ORDER), which is what lets a reader verify `psha256`, decode once, and split the stream by
-counting bytes. `docs/manifest-reader-contract.md` is the authority on the reader's side of that.
+counting bytes -- see tools/manifest_schema.py and tools/build_manifest.py for the producer side of
+that; the reader side lived in docs/manifest-reader-contract.md before that directory was deleted
+alongside the validator it supported (see git history).
 
 WHY THIS FILE EXISTS. The mod producer (`dist/tools/gen_manifest.py`) and the base-game producer
 (`tools/build_game_bundles.py`) both emit this format, and used to carry byte-identical copies of
@@ -21,14 +23,20 @@ reverted by the next sync like every other mirrored file.
 """
 import hashlib
 import os
+import sys
 
 import zstandard as zstd
 
-# --- wire-format settings: NOT tuning knobs ------------------------------------------------------
-ZSTD_LEVEL = 19
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # Capped at 27 by the spec: that is the reference decoder's default ZSTD_d_windowLogMax, so a bundle
 # never requires a reader to raise its window limit. Above it, correct readers refuse our bundles.
-ZSTD_WLOG = 27
+# Used to be a second, hand-duplicated copy of this exact commitment -- precisely the drift this
+# docstring warns about -- so it is imported from manifest_schema.py, the one place the wire format
+# is declared, rather than restated here.
+from manifest_schema import ZSTD_WLOG  # noqa: E402
+
+# --- wire-format settings: NOT tuning knobs ------------------------------------------------------
+ZSTD_LEVEL = 19
 # Single-threaded per compressor, and not for want of cores. libzstd derives its job size from the
 # window log, so at windowLog 27 anything under ~512 MiB is smaller than ONE job and exactly one
 # worker engages whatever `threads` says — the flag buys nothing here. What it COSTS is determinism:
@@ -80,7 +88,8 @@ def build_bundle(members, staging, label, tmp_name="bundle.tmp"):
     The returned `name` is PURELY content-addressed — label plus a prefix of the packed hash, with
     nothing positional in it. Identical bytes must always produce an identical name, or an
     incremental publish cannot tell "already uploaded" from "changed". (Uniqueness across a release
-    is enforced separately, by the B8 check on the assembled manifest.)
+    is enforced separately: tools/build_manifest.py refuses two bundles sharing one asset name, B8,
+    when the manifest is assembled.)
     """
     usize = sum(m["size"] for m in members)
     tmp = os.path.join(staging, tmp_name)

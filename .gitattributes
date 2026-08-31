@@ -1,7 +1,6 @@
-# A signature covers BYTES. Every file under docs/manifest-fixtures/ is either signed or a
-# signature, so a checkout that rewrites its line endings — one contributor with core.autocrlf=true
-# — invalidates the whole signature suite without touching a single commit. Nothing here is text as
+# A signature covers BYTES. *.pub (keys/*.pub, committed) and *.minisig are either a signature or
+# the key that checks one, so a checkout that rewrites their line endings — one contributor with
+# core.autocrlf=true — invalidates them without touching a single commit. Nothing here is text as
 # far as git is concerned.
-docs/manifest-fixtures/** -text
 *.minisig -text
 *.pub -text
