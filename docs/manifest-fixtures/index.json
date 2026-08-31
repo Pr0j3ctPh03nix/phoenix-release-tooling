@@ -24,7 +24,7 @@
     {
       "file": "schema2-options.json",
       "expect": "accept",
-      "why": "The shape the mod producer emitted before its payload became a single bundle — schema 2, every entry named, no bundles. Every mod release published up to that cutover is this shape and must stay installable, so a schema-3 reader that only handles bundled documents would break on every release already in the wild."
+      "why": "An unbundled document — schema 2, every entry named, no bundles. Schema 2 is IN RANGE, so a reader that handles only bundled documents is not conforming, however recently it was written. Which releases are actually served in this shape is a deployment question, and not one this suite answers."
     },
     {
       "file": "schema3-no-bundles.json",

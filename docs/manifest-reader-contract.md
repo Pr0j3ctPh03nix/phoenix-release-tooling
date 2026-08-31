@@ -12,8 +12,9 @@ the authority; port or consult them, don't reimplement from prose:
   Porting it gives you schema-first parsing, absent-`schema`==1, unknown-key tolerance, and
   unsupported-schema refusal for free.
 - **`docs/manifest-fixtures/`** (`index.json`) — example manifests, each with an expected outcome;
-  the conformance suite. `current.json` is the full shape at once; `schema2-options.json` is exactly
-  what the shim producer emits. `signatures/index.json` is the same idea for signature verification,
+  the conformance suite. `current.json` is the full shape at once; what every other fixture is FOR is
+  stated in its own `index.json` entry, which is the authority — restating it here only rots.
+  `signatures/index.json` is the same idea for signature verification,
   including the failures a correct verifier is the only thing that catches.
 - **`tools/phoenix_minisign.py`** — the signature format, and the ways it is deliberately narrower
   than upstream minisign. Also a working signer/verifier and its own `selftest`.
@@ -127,8 +128,7 @@ a retype/rename/removal of a field readers declare; a change to what a field *me
 never bump it. The signing envelope is the worked exception to "a new required field": a current
 reader refuses without it, yet no schema number could compel that check — a stripped `payload_id` is
 indistinguishable from a producer that predates signing, so the requirement lives in the reader
-(`manifest_schema.py` spells out the argument). Rationale and measurements for schema 3 (bundles):
-`bundle_format_plan.md`.
+(`manifest_schema.py` spells out the argument).
 
 Two known gaps, real and unsolved:
 - **`remove[]` is always emitted empty** — implement it fully anyway; a file whose `dest` changes is

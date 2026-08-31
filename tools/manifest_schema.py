@@ -12,11 +12,13 @@ any one producer emits. The distinction matters:
     (`groups` / `group`) are the worked example — a reader that ignores both renders one flat
     list, which is plainer, not wrong;
   * a PRODUCER declares the format it actually wrote in, and bumps only when it uses a feature
-    of the newer schema. Both producers emit 3 today — `gen_manifest.py` (`SCHEMA`) since the mod
-    payload became one bundle, and `build_game_bundles.py` (`SCHEMA`) since it was written. Each
-    keeps its OWN constant: a producer that emitted `FORMAT_SCHEMA` directly would collapse these
-    two numbers back together, and a spec-side bump here — a new fixture, a rule no reader has
-    learned yet — would silently raise the number in every manifest it writes.
+    of the newer schema. Each keeps its OWN `SCHEMA` constant, and that constant is the only thing
+    that can be right about it — read the number off the producer. Listing them here instead re-rots
+    every time one is added or moves, which is exactly what happened: this said "both producers"
+    while there were three, one of them emitting a different number. A producer that emitted
+    `FORMAT_SCHEMA` directly would collapse these two numbers back together, and a spec-side bump
+    here — a new fixture, a rule no reader has learned yet — would silently raise the number in
+    every manifest it writes.
 
 Bumping a producer ahead of the reader hard-fails every client at once, which is why these are
 separate numbers rather than one.
