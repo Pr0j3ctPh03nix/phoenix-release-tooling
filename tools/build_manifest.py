@@ -32,11 +32,13 @@ tools/validate_manifest.py used to check AFTER the fact:
     waiting to happen).
   * `build()` itself closes the gaps no single object's constructor can see, because they are
     properties of the WHOLE document assembled together: every entry with a positive size is either
-    named or bundled (B3); every bundle's members are all reachable from `files[]` or an option (the
-    rest of B1); no two bundles share a name (B8); no sha256 is claimed by two bundle slots even via
-    two DIFFERENT objects that happen to carry the same hash (the rest of B5 -- Bundle's own check is
-    by object identity and cannot see that case); and every tree reference resolves to one of the
-    manifest's own top-level entries.
+    named or its `sha256` is claimed by a bundle (B3, checked by HASH -- see `_check_unbundled` --
+    which is what lets two different dests legally share one bundled hash, the shape the base-game
+    producer's content-keyed bundling always relied on); every bundle's members are all reachable
+    from `files[]` or an option (the rest of B1); no two bundles share a name (B8); no sha256 is
+    claimed by two bundle slots even via two DIFFERENT objects that happen to carry the same hash
+    (the rest of B5 -- Bundle's own check is by object identity and cannot see that case); and every
+    tree reference resolves to one of the manifest's own top-level entries.
   * `schema` is Derived: 3 the instant any bundle exists, 2 otherwise. No caller ever sets it.
 
 B4 -- "nothing between members, nothing after the last" -- has no producer-side equivalent; it is a
@@ -183,10 +185,20 @@ def _asset_pool(entries, options):
     return pool
 
 
-def _check_unbundled(entries, options):
-    """B3: a positive-size asset with no `name` and no bundle has no route to bytes at all."""
+def _check_unbundled(entries, options, bundled_hashes):
+    """B3: a positive-size asset with no `name` and whose sha256 is in no bundle has no route to
+    bytes at all.
+
+    Checked by HASH (`bundled_hashes`, every sha256 that survived `_check_bundles` below), not by
+    "is this exact object inside some Bundle". The reader resolves an entry to bytes by hash -- see
+    docs/manifest-reader-contract.md's entry -> bytes order, back when docs/ existed: `size` 0 ->
+    empty; else `name` present -> that release asset; else -> the one bundle whose `members`
+    contains the entry's `sha256` -- and content-keyed producers (the base-game bundler among them)
+    legitimately point two different Entry objects at two different `dest`s with ONE shared hash,
+    stored once, inside a single bundle. Checking by object identity refused that legal shape;
+    checking by hash accepts it, while B5 below still refuses the same hash claimed by two bundles."""
     for a in _asset_pool(entries, options):
-        if a.size > 0 and a.name is None and a._bundle is None:
+        if a.size > 0 and a.name is None and a.sha256 not in bundled_hashes:
             where = getattr(a, "dest", None) or getattr(a, "id", "<entry>")
             raise ValueError(f"{where!r} has positive size, no `name`, and is in no bundle (B3)")
 
@@ -195,14 +207,20 @@ def _check_bundles(entries, bundles, options):
     """B8 (no two bundles share a name), the other half of B1 (a bundle can only pack an asset that
     is actually reachable from `files[]` or an option -- otherwise its dest is unrecoverable, even
     though manifest_schema.BUNDLE guarantees its `members` entry is never a stray hash), and B5.
+    Returns the set of every sha256 that legally belongs to exactly one bundle, for `_check_unbundled`
+    (B3) to resolve entries against -- so B3 can never accept a hash this function would have refused.
 
     B5 is checked by HASH here, not left to Bundle.__init__'s per-OBJECT `_bundle` tracking, because
     that tracking alone misses two shapes: the identical Entry object listed twice in one bundle's
     own `entries` (each check in that loop runs before either assignment lands), and two DISTINCT
     Entry/Variant objects that legitimately carry the same sha256 -- identical bytes at two
-    different dests, or a variant and a raw file sharing content -- placed in two different bundles.
-    Both produce a document with one hash claimed by two bundle slots, which is exactly what B5
-    forbids; only a scan over every member's sha256, once every bundle is known, catches both."""
+    different dests, or a variant and a raw file sharing content -- placed in two DIFFERENT bundles
+    (the bytes would ship twice, and the reader's "the one bundle whose members contains this hash"
+    rule becomes ambiguous). Both produce a document with one hash claimed by two bundle slots,
+    which is exactly what B5 forbids; only a scan over every member's sha256, once every bundle is
+    known, catches both. The SAME hash reused between a bundle and a LOOSE entry is not this case at
+    all -- see `_check_unbundled` -- and the same hash reused across several UNBUNDLED loose entries
+    was never restricted either."""
     pool = _asset_pool(entries, options)
     names = set()
     seen_hashes = set()
@@ -218,6 +236,7 @@ def _check_bundles(entries, bundles, options):
                 raise ValueError(f"sha256 {e.sha256[:12]} claimed by more than one bundle slot, "
                                  f"via bundle {b.name!r} (B5 -- one hash, one bundle)")
             seen_hashes.add(e.sha256)
+    return seen_hashes
 
 
 def _check_tree(tree, entries):
@@ -250,8 +269,11 @@ def build(payload_id, version, serial, entries, bundles=(), options=(), tree=Non
     options = list(options)
     tree = list(tree) if tree else []
 
-    _check_unbundled(entries, options)
-    _check_bundles(entries, bundles, options)
+    # _check_bundles first: it both validates the bundles themselves (B1/B5/B8) and returns the
+    # hash set _check_unbundled (B3) resolves entries against -- so B3 can only ever accept a hash
+    # that has already been proven to belong to exactly one bundle.
+    bundled_hashes = _check_bundles(entries, bundles, options)
+    _check_unbundled(entries, options, bundled_hashes)
     _check_tree(tree, entries)
 
     class _Doc:
@@ -611,6 +633,52 @@ def _selftest():
     refused("a choice default that names none of its own variants", default_not_a_variant)
     refused("a zero-size entry as a bundle member (B6)", zero_size_bundle_member)
     refused("a named (loose) entry placed in a bundle", named_entry_bundled)
+
+    # --- content-keyed sharing: one sha256, two dests. B3 resolves by HASH (see
+    # _check_unbundled), not by "is this exact object inside some Bundle" -- three shapes that
+    # must NOT be conflated, reproducing the base-game producer's legitimate use and the two ways
+    # sharing a hash still goes wrong. --------------------------------------------------------
+
+    def shared_hash_one_bundled_one_loose():
+        # a's bytes are stored once, inside `bun`; b names no bundle of its own but carries the
+        # SAME sha256, so the reader resolves it through that one bundle -- exactly the shape
+        # base-game bundling relies on (content-keyed: one hash, several dests). Must ACCEPT.
+        h = sha("shared")
+        a = Entry(dest="game/dota/x.txt", sha256=h, size=10)
+        b = Entry(dest="game/dota/copy/x.txt", sha256=h, size=10)
+        bun = Bundle(name="b000.phxb", codec="zstd", psize=5, psha256=sha("packed"), entries=[a])
+        doc = build(payload_id="game", version="1805", serial=schema.SERIAL_FLOOR + 1,
+                   entries=[a, b], bundles=[bun])
+        assert_(doc["bundles"][0]["members"] == [h], "the bundle carries the hash once, not twice")
+        b_out = next(f for f in doc["files"] if f["dest"] == "game/dota/copy/x.txt")
+        assert_("name" not in b_out, "b resolves through the shared hash, not a release asset")
+
+    def shared_hash_two_different_bundles():
+        # The SAME hash claimed by two SEPARATE bundles -- the bytes would ship twice, and "the
+        # one bundle whose members contains this hash" stops being well defined. Must REFUSE (B5).
+        h = sha("shared")
+        a = Entry(dest="game/dota/x.txt", sha256=h, size=10)
+        b = Entry(dest="game/dota/copy/x.txt", sha256=h, size=10)
+        bun1 = Bundle(name="b000.phxb", codec="zstd", psize=5, psha256=sha("p1"), entries=[a])
+        bun2 = Bundle(name="b001.phxb", codec="zstd", psize=5, psha256=sha("p2"), entries=[b])
+        build(payload_id="game", version="1805", serial=schema.SERIAL_FLOOR + 1,
+              entries=[a, b], bundles=[bun1, bun2])
+
+    def shared_hash_same_object_twice_one_bundle():
+        # The identical OBJECT listed twice inside one bundle's own entries -- still refused, same
+        # as before this fix; make sure resolving B3 by hash did not accidentally loosen B5 too.
+        h = sha("shared")
+        a = Entry(dest="game/dota/x.txt", sha256=h, size=10)
+        bun = Bundle(name="b000.phxb", codec="zstd", psize=5, psha256=sha("p"), entries=[a, a])
+        build(payload_id="game", version="1805", serial=schema.SERIAL_FLOOR + 1,
+              entries=[a], bundles=[bun])
+
+    ok("one sha256, one bundled entry and one loose entry sharing it -- resolves, ACCEPT",
+       shared_hash_one_bundled_one_loose)
+    refused("one sha256 claimed by two DIFFERENT bundles -- still B5, REFUSE",
+            shared_hash_two_different_bundles)
+    refused("the same entry object listed twice in one bundle, via the game producer's shape "
+            "-- still B5, REFUSE", shared_hash_same_object_twice_one_bundle)
 
     for good, name, detail in results:
         print(f"  {'ok  ' if good else 'FAIL'} {name}" + (f"\n         {detail}" if detail else ""))
