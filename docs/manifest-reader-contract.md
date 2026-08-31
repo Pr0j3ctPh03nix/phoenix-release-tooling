@@ -18,18 +18,26 @@ the authority; port or consult them, don't reimplement from prose:
 - **`tools/phoenix_minisign.py`** — the signature format, and the ways it is deliberately narrower
   than upstream minisign. Also a working signer/verifier and its own `selftest`.
 
-This document holds only what those cannot: the **install-time behaviour** (no validator ever touches
-a byte), a few **reader semantics** a document-checker has no reason to know, and the **boundary
-rule**. The reader is developed independently and must not read the *producer* to learn the format.
+This document holds only what those cannot: **document semantics that surface at install time** (no
+validator ever touches a byte), a few **reader semantics** a document-checker has no reason to know,
+and the **boundary rule**. The reader is developed independently and must not read the *producer* to
+learn the format.
+
+**Scope, and it is a hard line.** This repo defines the FORMAT and seals it. What a reader must do
+for the format's own guarantees to hold — verify before it commits, refuse what it cannot verify,
+resolve an entry to bytes by the one defined route — is in scope. HOW a reader installs — how it
+schedules, resumes, retries, persists a selection, or words a refusal to a user — is not, and is
+deliberately absent. Prose here that describes a reader's implementation cannot be checked by
+anything in this repo, so it would only rot.
 
 ## The boundary
 
 The manifest **declares the format it is written in** (`schema`); deciding whether it can be read is
 the reader's job — the producer never names a reader version. So: support a **range** of schemas,
-refuse one outside it with a user-facing **"update the app"** message (never a parse error), and raise
-your ceiling in the same change that teaches you the new format. Absent `schema` means 1. Schema 1, 2
-and 3 are all in range today, and the shipping reader implements all three — schema 3 (bundles) is
-published as game-dist `v1805` and read.
+refuse one outside it as an unsupported-VERSION refusal and never as a parse error — a manifest from
+the future is not malformed — and raise your ceiling in the same change that teaches you the new
+format. How that refusal reads to a user is the reader's own business. Absent `schema` means 1;
+1, 2 and 3 are defined today.
 
 ## Signatures — before anything else
 
@@ -60,10 +68,16 @@ Obligations no fixture can hold:
   its timestamp hands anyone with a wrong clock a client that can no longer update, and buys nothing
   that `serial` does not already cover.
 
-## Install-time obligations (no validator can hold these)
+## Document semantics that only bite at install time
+
+No validator can hold these: they are properties of the DOCUMENT that come into play only once
+something resolves it to bytes. How a reader schedules, resumes, retries or reports that work is the
+reader's own business and is deliberately not specified here.
 
 - **Verify before you write.** Check an asset's `sha256`/`psha256` **before** decoding or installing
-  it, and never commit a partially-verified file.
+  it, and never commit a partially-verified file. This is the hash chain, not hygiene: the signature
+  covers the manifest and the manifest's hashes cover the assets, so "what was installed is what was
+  signed" holds only if verification precedes commit.
 - **Entry → bytes** resolves by exactly one route, in order: `size` 0 → materialize an empty file;
   else `name` present → the release asset of that name; else → the one bundle whose `members` contains
   the entry's `sha256`.
@@ -73,13 +87,11 @@ Obligations no fixture can hold:
   `size`s; verify **each member's own `sha256`** before committing it (a torn or interrupted decode is
   then safe — nothing unverified is committed, nothing committed is lost); the decoded stream is
   exactly the members concatenated, with no padding or trailing bytes. A member mismatch **after** a
-  clean `psha256` is a producer defect — **fail, do not retry** (a refetch yields the same bytes).
-- **Resume per asset, not per file.** A partly-fetched bundle is progress toward all its members and
-  toward none individually.
+  clean `psha256` is deterministic — a producer defect, not a transport failure.
 - **`psize` vs `size` are different numbers** — `psize` is the packed asset on the wire (progress,
   ETA, scratch space); `size` is the decoded footprint on disk. Never interchange them.
 - **Codec** is `"zstd"`, window log capped at **27** (the reference decoder's default — no decoder
-  configuration needed). An unrecognised codec is an **"update the app"** refusal, not "corrupt".
+  configuration needed). An unrecognised codec is an unsupported-format refusal, not corruption.
 
 ## Reader semantics a validator has no reason to know
 
@@ -91,7 +103,7 @@ Obligations no fixture can hold:
   installs exactly one `variants[]` entry; a **`toggle`** is a `files[]` set, present when enabled and
   absent when disabled. `default` is a variant-id **string** for `choice`, a **boolean** for `toggle`.
   A `label`/`description` is a string or a `{"en":…,"ru":…}` map (fall back `en` → any). **Deselecting
-  an installed option removes its files**; selections live with the reader, not the game folder.
+  an installed option removes its files.**
 - **`tree` is PRESENTATIONAL and optional.** A nested display hierarchy for the always-installed
   content: nodes are `{label?, files?, groups?}`, where `files` lists `dest`s from `files[]`, depth
   is unbounded, and a node without a `label` just splices its content into its parent. It is **not an
