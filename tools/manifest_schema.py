@@ -1,50 +1,285 @@
-"""The manifest FORMAT version — shared by every producer and the fixture generator.
+"""The manifest FORMAT, declared as DATA.
 
-This is the highest schema the format defines (see docs/manifest-reader-contract.md), NOT what
-any one producer emits. The distinction matters:
+Nothing here builds a document -- see build_manifest.py for that. This module answers only "what
+does the wire format look like and what does each field mean", as a small vocabulary of field types
+(Const, Enum, Int, Str, Hex64, Dest, Label, Opt, List, Obj, Derived, Ref) composed into the five
+named shapes below (FILE, BUNDLE, NODE, OPTION, MANIFEST). Adding or changing a wire field is meant
+to be a ONE-FILE edit here; build_manifest.py's builder walks whatever this module declares and
+hardcodes no key name of its own.
 
-  * the format version moves ONLY when a change would force a producer to bump — that is, one a
-    reader cannot safely ignore. It moves together with the reader's supported ceiling and the
-    conformance fixtures. A purely ADDITIVE capability (a new top-level key, a new field older
-    readers can skip) is specified and fixture-covered at the CURRENT format version instead:
-    nothing about it requires a reader to be newer, so giving it a number would only invite a
-    producer to claim one and lock out readers that would have coped. Option categories
-    (`groups` / `group`) are the worked example — a reader that ignores both renders one flat
-    list, which is plainer, not wrong;
-  * a PRODUCER declares the format it actually wrote in, and bumps only when it uses a feature
-    of the newer schema. Each keeps its OWN `SCHEMA` constant, and that constant is the only thing
-    that can be right about it — read the number off the producer. Listing them here instead re-rots
-    every time one is added or moves, which is exactly what happened: this said "both producers"
-    while there were three, one of them emitting a different number. A producer that emitted
-    `FORMAT_SCHEMA` directly would collapse these two numbers back together, and a spec-side bump
-    here — a new fixture, a rule no reader has learned yet — would silently raise the number in
-    every manifest it writes.
+Two kinds of field carry no input from a caller at all:
 
-Bumping a producer ahead of the reader hard-fails every client at once, which is why these are
-separate numbers rather than one.
+  * Derived(fn) -- fn(owner) computes the value from data already on the object (bundle `size` from
+    its own entries' sizes, `schema` from whether any bundle exists, `remove` as the permanent empty
+    list -- see build_manifest.py's module docstring for why it stays empty). These are pure: no
+    randomness, no clock, no bytes read from disk, which is also why they can live here.
+  * Ref(attr) -- a cross-reference to another object's OWN field, e.g. a tree node's `files` are
+    Entry objects and the wire value is each one's `.dest`; a choice's `default` is one of its own
+    Variant objects and the wire value is that variant's `.id`. The caller never types the string
+    that ends up on the wire -- see build_manifest.py's docstring for why that is the whole point.
+
+`signed_at` is the one required key with no Derived function: it needs the wall clock, and this
+module does no I/O, no timekeeping and no hashing -- build_manifest.write() fills it in at the
+moment a document is actually written, never at build() time (a build() result must be a pure
+function of its inputs, or two builds of "the same" release would silently differ).
 """
 
-FORMAT_SCHEMA = 3
+SCHEMA = 3
 
-# --- the signing envelope ----------------------------------------------------------------------
-# Signing (docs/manifest-reader-contract.md) adds three top-level keys. They do NOT move
-# FORMAT_SCHEMA, even though a current reader REFUSES a document missing two of them, because that
-# requirement is reader POLICY and not document format:
-#
-#   * to a reader that does not verify signatures the keys are inert — it installs exactly what it
-#     installed before — so nothing about them needs a NEWER reader, which is the only thing a
-#     schema bump buys. Bumping would instead hard-fail every shipped client at once to deliver a
-#     capability those clients still would not have;
-#   * "refuse what I cannot verify" cannot be encoded in the document at all: a stripped
-#     `payload_id` is indistinguishable from a producer that predates signing, so no field value
-#     could ever compel the check. Whether the keys are required is therefore a build-time property
-#     of the reader, exactly like validate_manifest.MAX_SCHEMA — not a property of the format.
-PAYLOAD_ID = "payload_id"   # which payload the document describes; one of PAYLOAD_IDS
-SERIAL = "serial"           # non-negative int, monotonic per payload — the SOLE ordering authority
-SIGNED_AT = "signed_at"     # unix seconds, ADVISORY: nothing may fail on it, clocks and CI lie
+# Deliberately WITHOUT "mirrors": nothing in this codebase emits one or reads one. Adding it back
+# is an ADDITIVE change to this tuple alone, made the day something actually produces it -- not
+# reserved speculatively, which is exactly how the previous four-entry set went stale (see git
+# history: validate_manifest.py carried a second, hand-duplicated copy of this same set, and the
+# two were free to drift apart with nothing to notice).
+PAYLOAD_IDS = ("mod", "launcher", "game")
 
-# Closed set. Each id names a payload with its own release source, its own key and its own install
-# action, so a reader can only act on ids it was built to know; an unrecognised one is a document
-# it cannot dispatch, not a document from the future. Adding one is an additive change HERE,
-# shipped together with the reader that handles it.
-PAYLOAD_IDS = {"mod", "launcher", "game", "mirrors"}
+CODECS = ("zstd",)
+
+# The CI floor: below this, a serial almost certainly came from a build counter that reset (a
+# renamed workflow, a fresh repo) rather than from a genuine republish. See build_manifest.py's
+# Int(min=SERIAL_FLOOR) use on `serial`.
+SERIAL_FLOOR = 2_000_000
+
+# The reference zstd decoder's default ZSTD_d_windowLogMax -- a bundle built at a higher window log
+# would need a reader to raise its own limit, so this is a wire-format ceiling, not a tuning knob.
+ZSTD_WLOG = 27
+
+
+# --- the field vocabulary -------------------------------------------------------------------------
+# Each of these answers exactly one question -- given a RAW value, what belongs on the wire, or why
+# not -- and nothing else. build_manifest.py is the only code that calls render(); a field that
+# raises makes the document it would have poisoned impossible to produce, rather than merely flagged
+# after the fact.
+
+class Const:
+    """A key whose value never varies and is never supplied by a caller."""
+    def __init__(self, value):
+        self.value = value
+
+    def render(self, _raw):
+        return self.value
+
+
+class Enum:
+    """One of a fixed, closed set of values -- matched by VALUE AND TYPE.
+
+    Python's `bool` is a subtype of `int` (`True == 1`), so a same-value check alone would let a
+    boolean slip through an int enum and vice versa -- the identical trap `schema`/`serial` guard
+    against elsewhere in this format (see tools/manifest_schema.py's old validator, now folded into
+    Int below). Matching type as well is what lets this ALSO serve as the boolean field type: a
+    toggle's `default` is `Enum(True, False)`, and nothing else is needed for it."""
+    def __init__(self, *values):
+        self.values = values
+
+    def render(self, value):
+        if not any(type(value) is type(v) and value == v for v in self.values):
+            raise ValueError(f"{value!r} is not one of {self.values!r}")
+        return value
+
+
+class Int:
+    """A whole number, optionally floored. Rejects `bool` explicitly for the reason above."""
+    def __init__(self, min=None):
+        self.min = min
+
+    def render(self, value):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{value!r} is not a whole number")
+        if self.min is not None and value < self.min:
+            raise ValueError(f"{value} is below the minimum {self.min}")
+        return value
+
+
+class Str:
+    """A non-empty string -- used for ids, names, versions and free text alike."""
+    def render(self, value):
+        if not isinstance(value, str) or not value:
+            raise TypeError(f"{value!r} is not a non-empty string")
+        return value
+
+
+class Hex64:
+    """A lowercase 64-hex sha256 digest -- the ONLY form this format ever carries one in."""
+    _DIGITS = frozenset("0123456789abcdef")
+
+    def render(self, value):
+        if not isinstance(value, str) or len(value) != 64 or any(c not in self._DIGITS for c in value):
+            raise ValueError(f"{value!r} is not a lowercase 64-hex sha256")
+        return value
+
+
+class Dest:
+    """An install path: relative to the game root, always forward-slashed, never escaping it.
+
+    Ports every rule tools/validate_manifest.py's `unsafe_dest` used to check -- empty/non-string,
+    backslash, absolute (leading `/`), `..` traversal -- as something a caller CANNOT construct
+    rather than something caught afterwards. One rule is WIDER than the ported original: the old
+    check only refused a colon at index 1 (`C:...`, the drive-letter form); this refuses a colon
+    ANYWHERE, because on Windows -- the only platform anything here installs onto -- a colon after
+    the first path segment names an NTFS alternate data stream (`file.txt:evil`), which is exactly
+    the same "write somewhere the author didn't intend" hazard traversal is. Losing no rule from the
+    port does not mean adding no rule to it."""
+    def render(self, value):
+        if not isinstance(value, str) or not value:
+            raise ValueError("dest must be a non-empty string")
+        if "\\" in value:
+            raise ValueError(f"{value!r}: backslash (dest must be forward-slashed)")
+        if ":" in value:
+            raise ValueError(f"{value!r}: ':' (a drive letter or an NTFS alternate data stream)")
+        if value.startswith("/"):
+            raise ValueError(f"{value!r}: absolute path")
+        if ".." in value.split("/"):
+            raise ValueError(f"{value!r}: '..' escapes the game root")
+        return value
+
+
+class Label:
+    """A display string, or a `{lang: text}` map (fallback `en` -> any is the READER's job, not
+    this format's -- see docs/manifest-reader-contract.md, back when docs/ existed)."""
+    def render(self, value):
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, dict) and value and all(
+                isinstance(k, str) and isinstance(v, str) and v for k, v in value.items()):
+            return dict(value)
+        raise TypeError(f"{value!r} is not a label string or a non-empty {{lang: text}} map")
+
+
+class Opt:
+    """The wrapped field may be absent: a raw value of None omits the key entirely rather than
+    writing `null`, which is the shape every existing producer already used."""
+    def __init__(self, inner):
+        self.inner = inner
+
+
+class List:
+    """Zero or more of `inner`, in order. Order is meaningful for bundle-derived fields (a bundle
+    splits its decoded stream by counting bytes against its members IN ORDER) and cosmetic
+    everywhere else."""
+    def __init__(self, inner):
+        self.inner = inner
+
+
+class Obj:
+    """A nested JSON object: an ORDERED {wire key: field} vocabulary. `fields` is a plain dict --
+    declared as data, walked by build_manifest.py, never referenced by key name outside this file
+    (`NODE.fields["groups"]` below is the one necessary exception, for self-reference)."""
+    def __init__(self, **fields):
+        self.fields = fields
+
+
+class Derived:
+    """A field the BUILDER computes -- `fn(owner) -> value`, or `None` when even the builder cannot
+    compute it without something this module refuses to do itself (I/O, the clock, hashing); see
+    `signed_at` below and build_manifest.write()."""
+    def __init__(self, fn):
+        self.fn = fn
+
+
+class Ref:
+    """A cross-reference to another object's OWN field: the raw value is that object, `attr` names
+    which of ITS fields ends up on the wire. This is what makes "the input language never refers to
+    anything by string" hold structurally -- a tree node's `files` are Entry objects (Ref("dest")),
+    a choice's `default` is one of its own Variant objects (Ref("id")); there is no string a caller
+    could mistype into a dangling reference."""
+    def __init__(self, attr):
+        self.attr = attr
+
+
+# --- the wire shapes ---------------------------------------------------------------------------
+
+# One file-bearing entry as it appears in `files[]`, or in a toggle option's `files[]`. `name` is
+# present only for a LOOSE entry (its own release asset); absent, it is a bundle member instead --
+# build_manifest.py's Entry/Bundle enforce that this is the only two states an entry can be in.
+FILE = Obj(
+    name=Opt(Str()),
+    dest=Dest(),
+    sha256=Hex64(),
+    size=Int(min=0),
+)
+
+# A choice option's one variant. Shares its option's `dest` (there is no `dest` field here); is
+# otherwise exactly a FILE plus a stable `id` and its own `label`.
+VARIANT = Obj(
+    id=Str(),
+    label=Label(),
+    name=Opt(Str()),
+    sha256=Hex64(),
+    size=Int(min=0),
+)
+
+# A `.phxb` bundle. `size` and `members` are DERIVED from the entries the bundle actually packs --
+# see build_manifest.Bundle -- so a size-sum mismatch or an orphan member cannot be expressed; there
+# is no field here a caller can set directly for either.
+BUNDLE = Obj(
+    name=Str(),
+    codec=Enum(*CODECS),
+    psize=Int(min=0),
+    psha256=Hex64(),
+    size=Derived(lambda b: sum(e.size for e in b.entries)),
+    members=Derived(lambda b: [e.sha256 for e in b.entries]),
+)
+
+# The presentational display tree: `{label?, files?, groups?}`, unbounded depth, a node without a
+# `label` splices into its parent. `files` are Ref("dest") -- Entry objects whose dest ends up on
+# the wire -- so a tree can only ever point at an entry that genuinely exists (build_manifest.py
+# additionally requires it be one of the manifest's own top-level entries, matching what
+# docs/manifest-reader-contract.md said tree may reference).
+NODE = Obj(
+    label=Opt(Label()),
+    files=Opt(List(Ref("dest"))),
+)
+NODE.fields["groups"] = Opt(List(NODE))   # self-reference; must come after NODE exists
+
+# A choice shares one `dest` among mutually-exclusive `variants`; `default` is Ref("id") -- one of
+# those SAME Variant objects, never a typed string -- so a default that names no variant cannot be
+# expressed (build_manifest.Choice checks `default in variants` at construction).
+_OPTION_CHOICE = Obj(
+    id=Str(),
+    kind=Const("choice"),
+    label=Label(),
+    default=Ref("id"),
+    dest=Dest(),
+    variants=List(VARIANT),
+)
+
+# A toggle is a `files[]` set, installed when enabled. `default` is Enum(True, False) -- see Enum's
+# docstring for why that alone is a sound boolean field.
+_OPTION_TOGGLE = Obj(
+    id=Str(),
+    kind=Const("toggle"),
+    label=Label(),
+    default=Enum(True, False),
+    files=List(FILE),
+)
+
+# The choice/toggle union: a plain dict keyed by `kind`, not a new vocabulary primitive -- one
+# option shape or the other is picked by the INPUT object's own `.kind`, which build_manifest.py's
+# walker dispatches on wherever it meets a dict instead of an Obj.
+OPTION = {"choice": _OPTION_CHOICE, "toggle": _OPTION_TOGGLE}
+
+# The document itself. `signed_at` and `remove` are commented individually below; everything else
+# either comes straight from a builder argument (same key name -- see build_manifest.build) or is
+# Derived from the objects the caller passed in.
+MANIFEST = Obj(
+    # 3 exactly when a bundle exists, else 2 -- "the widest compatibility the honest number
+    # allows". No producer keeps its own SCHEMA constant any more; this is the one place that
+    # decides, and it decides from the DOCUMENT's own shape, never from a caller's say-so.
+    schema=Derived(lambda m: SCHEMA if m.bundles else 2),
+    payload_id=Enum(*PAYLOAD_IDS),
+    serial=Int(min=SERIAL_FLOOR),
+    # No fn: needs the wall clock, which this module does not touch. build_manifest.write() sets it
+    # at the moment of writing, never inside build() -- see that module's docstring.
+    signed_at=Derived(None),
+    version=Str(),
+    notes=Opt(Str()),
+    bundles=Opt(List(BUNDLE)),
+    files=List(FILE),
+    # A known, permanent gap (see the old docs/manifest-reader-contract.md, and every producer that
+    # ever existed): nothing here can populate a removal, so a retired file's old dest is orphaned
+    # forever. Encoding that honestly -- always empty, never a caller argument -- beats silently
+    # "fixing" it in a rewrite nobody asked to change the format's actual behaviour.
+    remove=Derived(lambda m: []),
+    tree=Opt(List(NODE)),
+    options=Opt(List(OPTION)),
+)
