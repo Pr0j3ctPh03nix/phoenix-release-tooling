@@ -1,0 +1,6 @@
+# Bytecode from running the checks in this repo.
+__pycache__/
+
+# A net under the key rule: no PRIVATE key ever belongs in this repo. Only the
+# public halves in keys/ are tracked.
+*.key
