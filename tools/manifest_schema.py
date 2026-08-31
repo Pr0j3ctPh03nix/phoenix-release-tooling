@@ -12,16 +12,23 @@ Two kinds of field carry no input from a caller at all:
   * Derived(fn) -- fn(owner) computes the value from data already on the object (bundle `size` from
     its own entries' sizes, `schema` from whether any bundle exists, `remove` as the permanent empty
     list -- see build_manifest.py's module docstring for why it stays empty). These are pure: no
-    randomness, no clock, no bytes read from disk, which is also why they can live here.
+    randomness, no clock, no bytes read from disk, which is also why they can live here. `fn` may
+    return `ABSENT` (below) to say the key does not belong on the wire at all this time -- the walk
+    then omits it, exactly like an absent Opt.
   * Ref(attr) -- a cross-reference to another object's OWN field, e.g. a tree node's `files` are
     Entry objects and the wire value is each one's `.dest`; a choice's `default` is one of its own
     Variant objects and the wire value is that variant's `.id`. The caller never types the string
     that ends up on the wire -- see build_manifest.py's docstring for why that is the whole point.
 
-`signed_at` is the one required key with no Derived function: it needs the wall clock, and this
-module does no I/O, no timekeeping and no hashing -- build_manifest.write() fills it in at the
-moment a document is actually written, never at build() time (a build() result must be a pure
-function of its inputs, or two builds of "the same" release would silently differ).
+`signed_at` needs the wall clock, and this module does no I/O, no timekeeping and no hashing -- so
+it cannot compute the value itself. It is still an ordinary Derived field, not a special case the
+walker has to know the name of: its `fn` reads `owner.signed_at`, a plain attribute build() always
+sets (to `None` by default) and that write() overwrites with the real timestamp just before
+rendering. `fn` returns `ABSENT` while that attribute is `None`, so build() alone -- never told a
+time -- omits the key, and stays a pure function of its inputs; two builds of "the same" release
+never differ. The KEY NAME "signed_at" appears exactly once outside this module: as build()'s
+keyword-only parameter of the same name, which is a naming convention (like `payload_id` or
+`version`), not the walker special-casing a string.
 """
 
 SCHEMA = 3
@@ -50,6 +57,11 @@ ZSTD_WLOG = 27
 # not -- and nothing else. build_manifest.py is the only code that calls render(); a field that
 # raises makes the document it would have poisoned impossible to produce, rather than merely flagged
 # after the fact.
+
+# The one value that means "this key does not appear on the wire this time" -- what an absent Opt
+# already meant, and what a Derived(fn) may now also return. A plain `object()`: nothing about it is
+# I/O, the clock or a hash, so it costs this module nothing to own it.
+ABSENT = object()
 
 class Const:
     """A key whose value never varies and is never supplied by a caller."""
@@ -113,12 +125,18 @@ class Dest:
 
     Ports every rule tools/validate_manifest.py's `unsafe_dest` used to check -- empty/non-string,
     backslash, absolute (leading `/`), `..` traversal -- as something a caller CANNOT construct
-    rather than something caught afterwards. One rule is WIDER than the ported original: the old
-    check only refused a colon at index 1 (`C:...`, the drive-letter form); this refuses a colon
-    ANYWHERE, because on Windows -- the only platform anything here installs onto -- a colon after
-    the first path segment names an NTFS alternate data stream (`file.txt:evil`), which is exactly
-    the same "write somewhere the author didn't intend" hazard traversal is. Losing no rule from the
-    port does not mean adding no rule to it."""
+    rather than something caught afterwards. Two rules are WIDER than that ported original:
+
+      * the old check only refused a colon at index 1 (`C:...`, the drive-letter form); this refuses
+        a colon ANYWHERE, because on Windows -- the only platform anything here installs onto -- a
+        colon after the first path segment names an NTFS alternate data stream (`file.txt:evil`),
+        which is exactly the same "write somewhere the author didn't intend" hazard traversal is;
+      * an empty path component (`game/dota//x.txt`, or a trailing `/`) was not checked by
+        `unsafe_dest` either, but the READER's own `check_dest` refuses it -- so a producer built
+        against `unsafe_dest` alone could emit a manifest the launcher then rejects at install time.
+        Refusing it here closes that gap now that this is the one definition of a legal dest.
+
+    Losing no rule from the port does not mean adding no rule to it."""
     def render(self, value):
         if not isinstance(value, str) or not value:
             raise ValueError("dest must be a non-empty string")
@@ -128,7 +146,10 @@ class Dest:
             raise ValueError(f"{value!r}: ':' (a drive letter or an NTFS alternate data stream)")
         if value.startswith("/"):
             raise ValueError(f"{value!r}: absolute path")
-        if ".." in value.split("/"):
+        parts = value.split("/")
+        if "" in parts:
+            raise ValueError(f"{value!r}: empty path component (a doubled or trailing '/')")
+        if ".." in parts:
             raise ValueError(f"{value!r}: '..' escapes the game root")
         return value
 
@@ -169,9 +190,11 @@ class Obj:
 
 
 class Derived:
-    """A field the BUILDER computes -- `fn(owner) -> value`, or `None` when even the builder cannot
-    compute it without something this module refuses to do itself (I/O, the clock, hashing); see
-    `signed_at` below and build_manifest.write()."""
+    """A field the BUILDER computes -- `fn(owner) -> value`, where `owner` is the object the field
+    belongs to (a Bundle for `size`/`members`, the document itself for `schema`/`remove`/
+    `signed_at`). `fn` may return `ABSENT` to omit the key entirely -- see `signed_at` below, the
+    one field this module cannot compute a value for itself (it needs the wall clock), but can still
+    declare structurally: its `fn` just reads whatever build_manifest.py put on `owner.signed_at`."""
     def __init__(self, fn):
         self.fn = fn
 
@@ -268,9 +291,10 @@ MANIFEST = Obj(
     schema=Derived(lambda m: SCHEMA if m.bundles else 2),
     payload_id=Enum(*PAYLOAD_IDS),
     serial=Int(min=SERIAL_FLOOR),
-    # No fn: needs the wall clock, which this module does not touch. build_manifest.write() sets it
-    # at the moment of writing, never inside build() -- see that module's docstring.
-    signed_at=Derived(None),
+    # Reads whatever build_manifest.py put on `owner.signed_at` -- None by default (build() alone
+    # never touches the clock), the real timestamp once write() supplies one. ABSENT while it is
+    # None, so the key is simply missing from a plain build() result, never `null`.
+    signed_at=Derived(lambda m: ABSENT if m.signed_at is None else m.signed_at),
     version=Str(),
     notes=Opt(Str()),
     bundles=Opt(List(BUNDLE)),

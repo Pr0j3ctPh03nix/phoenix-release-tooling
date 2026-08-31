@@ -143,16 +143,13 @@ class Node:
 
 # --- the generic walk: manifest_schema.MANIFEST in, a wire dict out -------------------------------
 
-_ABSENT = object()   # a Derived field whose function is None (signed_at) -- write() supplies it
-
-
 def _value(field, raw):
     if isinstance(field, schema.Derived):
-        return field.fn(raw) if field.fn else _ABSENT
+        return field.fn(raw)                          # may itself return schema.ABSENT
     if isinstance(field, schema.Ref):
         return getattr(raw, field.attr)
     if isinstance(field, schema.Opt):
-        return _ABSENT if raw is None else _value(field.inner, raw)
+        return schema.ABSENT if raw is None else _value(field.inner, raw)
     if isinstance(field, schema.List):
         return [_value(field.inner, item) for item in raw]
     if isinstance(field, schema.Obj):
@@ -170,7 +167,7 @@ def _render_obj(obj, owner):
     for key, field in obj.fields.items():
         raw = owner if isinstance(field, schema.Derived) else getattr(owner, key, None)
         value = _value(field, raw)
-        if value is not _ABSENT:
+        if value is not schema.ABSENT:
             out[key] = value
     return out
 
@@ -237,11 +234,17 @@ def _check_tree(tree, entries):
 
 # --- the public API ---------------------------------------------------------------------------
 
-def build(payload_id, version, serial, entries, bundles=(), options=(), tree=None, notes=None):
-    """-> a manifest dict, minus `signed_at` (see manifest_schema.MANIFEST and write() below).
+def build(payload_id, version, serial, entries, bundles=(), options=(), tree=None, notes=None,
+          signed_at=None):
+    """-> a manifest dict.
 
     `entries` become `files[]`. `bundles`/`options`/`tree` are omitted from the document entirely
-    when empty -- the shape every existing producer already used for "this release has none"."""
+    when empty -- the shape every existing producer already used for "this release has none".
+
+    `signed_at` defaults to None, which manifest_schema.MANIFEST's Derived reads as "omit the key"
+    -- so a plain build() call is a pure function of its arguments and never touches the clock.
+    write() below is the only caller that passes a real timestamp; nothing stops another caller
+    doing the same, but nothing needs to."""
     entries = list(entries)
     bundles = list(bundles)
     options = list(options)
@@ -259,19 +262,19 @@ def build(payload_id, version, serial, entries, bundles=(), options=(), tree=Non
     doc.files = entries
     doc.tree = tree or None
     doc.options = options or None
+    doc.signed_at = signed_at
 
     return _render_obj(schema.MANIFEST, doc)
 
 
 def write(path, payload_id, version, serial, entries, bundles=(), options=(), tree=None, notes=None):
-    """build(), stamp `signed_at` with the wall clock, and write the result to `path`.
+    """build() with the wall clock filled in for `signed_at`, then write the result to `path`.
 
     `signed_at` is ADVISORY (docs/manifest-reader-contract.md, back when docs/ existed) and is the
     one field genuinely tied to the moment of writing rather than to the release's content -- which
-    is why it is set here and not inside build(), and why build() alone stays a pure function of its
-    arguments."""
-    doc = build(payload_id, version, serial, entries, bundles, options, tree, notes)
-    doc["signed_at"] = int(time.time())
+    is why the timestamp is taken here and not inside a plain build() call."""
+    doc = build(payload_id, version, serial, entries, bundles, options, tree, notes,
+               signed_at=int(time.time()))
 
     out_dir = os.path.dirname(os.path.abspath(path))
     if out_dir:
@@ -463,6 +466,9 @@ def _selftest():
     refused("dest with a leading '/' is absolute", lambda: with_dest("/game/evil.dll"))
     refused("dest with a backslash", lambda: with_dest("game\\evil.dll"))
     refused("dest with a drive/ADS colon", lambda: with_dest("game/evil.dll:hidden"))
+    refused("dest with an empty path component (doubled '/')",
+            lambda: with_dest("game/dota//evil.dll"))
+    refused("dest with a trailing '/'", lambda: with_dest("game/dota/evil.dll/"))
 
     # --- 4. bad sha256 / payload_id / codec / serial floor are each refused --------------------
 
@@ -542,6 +548,30 @@ def _selftest():
                                   "sha256": sha("exe"), "size": 12345678}], "files")
 
     ok("a one-entry launcher-shaped document builds and derives schema 2", launcher_shaped)
+
+    # --- 7. write() threads signed_at through the SAME schema-driven walk as every other field --
+    # (proves the fix for the one wire key that used to be set by a hardcoded `doc["signed_at"] = `
+    # in write() itself, bypassing the walker -- see manifest_schema.MANIFEST's `signed_at` field.)
+
+    def write_stamps_signed_at():
+        import tempfile
+        e = entry("game/dota/a.bin", sha("a"), 10, name="a.bin")
+        tmp_dir = tempfile.mkdtemp()
+        path = os.path.join(tmp_dir, "manifest.json")
+        before = int(time.time())
+        doc = write(path, "mod", "1.0.0", schema.SERIAL_FLOOR, [e])
+        after = int(time.time())
+        assert_("signed_at" in doc, "write() must set signed_at")
+        assert_(isinstance(doc["signed_at"], int) and not isinstance(doc["signed_at"], bool),
+                "signed_at must be a plain int")
+        assert_(before <= doc["signed_at"] <= after, "signed_at must be roughly now")
+        with open(path, encoding="utf-8") as fh:
+            on_disk = json.load(fh)
+        assert_(on_disk == doc, "the written file must match what write() returned")
+        assert_(list(on_disk.keys())[:4] == ["schema", "payload_id", "serial", "signed_at"],
+                f"signed_at should land in its schema-declared position, got {list(on_disk.keys())}")
+
+    ok("write() stamps signed_at through the schema, not by hardcoding the key", write_stamps_signed_at)
 
     # --- extra: the other structural rules the deleted validator also carried ------------------
 
