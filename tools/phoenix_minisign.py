@@ -35,8 +35,8 @@ Deliberate narrowings of upstream minisign, which any second implementation has 
     passphrase no human ever types is just a second secret stored beside the first.
 
 Needs `cryptography` — the only non-stdlib dependency in this repo's tooling, and only here; the
-document-only path (validate_manifest.validate) must never pull it in. The `minisign` CLI is not
-used and does not have to exist.
+document-only path (manifest_schema.py, build_manifest.py) must never pull it in. The `minisign`
+CLI is not used and does not have to exist.
 
     python tools/phoenix_minisign.py keygen --sec phoenix.key --pub phoenix.pub
     python tools/phoenix_minisign.py sign --sec phoenix.key manifest.json
