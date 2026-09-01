@@ -181,11 +181,12 @@ class Dest:
     path is the game root plus this -- the root is the user's, unknown here and unknowable at build
     time, so any ceiling this module named would be a guess in both directions. The reader joins the
     two and is the only thing that can weigh them."""
-    # Trailing space/dot trimmed first (see below), then the stem before the first '.': `NUL `,
-    # `nul.txt` and `NUL.tar.gz` all name the device. COM/LPT take any single digit, matching the
-    # reader's own set (its `is_reserved_device` tests `is_ascii_digit`, so COM0/LPT0 are refused
-    # there too) -- a dest this module allows and the launcher then refuses is the exact
-    # buildable-but-uninstallable gap these rules exist to close.
+    # Compared against the stem before the first '.', so `nul`, `nul.txt` and `NUL.tar.gz` all name
+    # the device. Nothing is trimmed first: a component ending in a space or a dot is refused
+    # outright below, which is what a reader has to trim for (`NUL ` is the device too). COM/LPT
+    # take any single digit, matching the reader's own set (its `is_reserved_device` tests
+    # `is_ascii_digit`, so COM0/LPT0 are refused there too) -- a dest this module allows and the
+    # launcher then refuses is the exact buildable-but-uninstallable gap these rules exist to close.
     _DEVICES = frozenset(("con", "prn", "aux", "nul")
                          + tuple(f"com{d}" for d in "0123456789")
                          + tuple(f"lpt{d}" for d in "0123456789"))
