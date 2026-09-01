@@ -35,10 +35,13 @@ tools/validate_manifest.py used to check AFTER the fact:
     named or its `sha256` is claimed by a bundle (B3, checked by HASH -- see `_check_unbundled` --
     which is what lets two different dests legally share one bundled hash, the shape the base-game
     producer's content-keyed bundling always relied on); every bundle's members are all reachable
-    from `files[]` or an option (the rest of B1); no two bundles share a name (B8); no sha256 is
-    claimed by two bundle slots even via two DIFFERENT objects that happen to carry the same hash
-    (the rest of B5 -- Bundle's own check is by object identity and cannot see that case); and every
-    tree reference resolves to one of the manifest's own top-level entries.
+    from `files[]` or an option (the rest of B1); no sha256 is claimed by two bundle slots even via
+    two DIFFERENT objects that happen to carry the same hash (the rest of B5 -- Bundle's own check
+    is by object identity and cannot see that case); every tree reference resolves to one of the
+    manifest's own top-level entries; and the document's two NAMESPACES each hold one thing per
+    slot -- no two entries install to one `dest` (`_check_dests`), and no two release assets, bundle
+    or loose, answer to one `name` (`_check_names`, which is B8 widened to the namespace a bundle
+    name really shares).
   * `schema` is Derived: 3 the instant any bundle exists, 2 otherwise. No caller ever sets it.
 
 B4 -- "nothing between members, nothing after the last" -- has no producer-side equivalent; it is a
@@ -126,7 +129,12 @@ class Bundle:
 
 class Choice:
     """An option offering exactly one of several Variant objects. `default` MUST be one of
-    `variants` -- checked here, at construction, so a default naming no variant cannot exist."""
+    `variants` -- checked here, at construction, so a default naming no variant cannot exist.
+
+    `assets`/`dests` are the two questions build() asks of every option, answered by the class next
+    to the `kind` that renders it rather than by anything dispatching on type -- see
+    _option_assets(). Whichever variant wins installs to the option's ONE `dest`, so a choice claims
+    exactly one install path however many variants it offers."""
     kind = "choice"
 
     def __init__(self, id, label, default, dest, variants):
@@ -136,14 +144,31 @@ class Choice:
         self.id, self.label, self.default, self.dest = id, label, default, dest
         self.variants = variants
 
+    @property
+    def assets(self):
+        return self.variants
+
+    @property
+    def dests(self):
+        return [self.dest]
+
 
 class Toggle:
-    """An option installing a `files[]` set when enabled."""
+    """An option installing a `files[]` set when enabled. Its files ARE its assets, and each one
+    carries its own dest (see Choice for why both properties exist)."""
     kind = "toggle"
 
     def __init__(self, id, label, default, files):
         self.id, self.label, self.default = id, label, default
         self.files = list(files)
+
+    @property
+    def assets(self):
+        return self.files
+
+    @property
+    def dests(self):
+        return [f.dest for f in self.files]
 
 
 class Node:
@@ -172,6 +197,9 @@ def _value(field, raw):
     if isinstance(field, schema.Obj):
         return _render_obj(field, raw)
     if isinstance(field, dict):                       # OPTION: a kind-dispatched union
+        # `raw.kind` keys this union AND selects the assets the option owns -- one dispatch, in
+        # _option_assets(), which build() runs over every option before a key is rendered. So a kind
+        # outside the union has already been refused by name and cannot arrive here as a KeyError.
         return _render_obj(field[raw.kind], raw)
     return field.render(raw)                          # Const / Enum / Int / Str / Hex64 / Dest / Label
 
@@ -191,16 +219,89 @@ def _render_obj(obj, owner):
 
 # --- cross-object checks: properties of the WHOLE document, not of any one field ------------------
 
+def _option_assets(option):
+    """The Assets one option owns, and the ONE place an option's `kind` meets the closed union.
+
+    The union used to be dispatched two ways: the walk picked the wire shape by `raw.kind`
+    (manifest_schema.OPTION), this picked the asset list by `isinstance(o, Choice)`. Anything the
+    two disagreed about -- a Choice subclass overriding `kind`, a caller's own option class -- was
+    rendered as one shape while B1/B3 inspected the other's assets, or died on `.files` with an
+    AttributeError. Now `kind` alone decides, and the list comes off the object (Choice.assets /
+    Toggle.assets), declared beside the `kind` it belongs to. build() calls this over every option
+    before rendering starts, which is also what makes an unknown kind a refusal here instead of a
+    KeyError inside the walk."""
+    if option.kind not in schema.OPTION:
+        raise ValueError(f"option {getattr(option, 'id', '?')!r}: unknown kind {option.kind!r} "
+                         f"(the format defines {tuple(schema.OPTION)})")
+    return option.assets
+
+
 def _asset_pool(entries, options):
     """Every Asset the document could legally bundle: top-level entries, plus every choice's
-    variants and every toggle's files. Mirrors tools/validate_manifest.py's old `entries()`."""
+    variants and every toggle's files. Mirrors tools/validate_manifest.py's old `entries()`.
+
+    Built ONCE per build() and passed down, together with the id() index below: it used to be
+    rebuilt for each of the two checks that need it, and `e not in pool` scanned it per bundle
+    member -- 4,635 entries x 4,815 members for the base game, ~22M comparisons to answer a
+    membership question."""
     pool = list(entries)
     for o in options:
-        pool += o.variants if isinstance(o, Choice) else o.files
+        pool += _option_assets(o)
     return pool
 
 
-def _check_unbundled(entries, options, bundled_hashes):
+def _id_index(pool):
+    """id() -> membership for `pool`. These objects define no __eq__/__hash__, so `in` compares them
+    by identity anyway and a set is the same answer without the scan -- keyed on id() because they
+    are not hashable by value. The CALLER must hold `pool` alive for as long as the index is used:
+    CPython recycles the id of a freed object, and a recycled id is a false positive."""
+    return {id(a) for a in pool}
+
+
+def _check_dests(entries, options):
+    """No two things in one document may install to the same path.
+
+    The pool is the READER's: top-level files[], each toggle's files, and each choice's own dest --
+    a choice's variants are mutually exclusive and SHARE that one dest, so they must not each count.
+    A duplicate is not a resolvable conflict, it is two entries silently overwriting each other in
+    whatever order the installer happens to run, and the loser's bytes are downloaded for nothing.
+
+    Compared case-folded, because the only filesystem this installs onto is case-insensitive:
+    `game/dota/A.txt` and `game/dota/a.txt` are two legal entries -- both pass every field rule and
+    the reader's own checks -- naming ONE file. `lower()`, not `casefold()`: casefold folds 'ss' out
+    of 'ß', and those genuinely are two different files on Windows. Only the comparison folds; what
+    goes on the wire is the dest exactly as the caller wrote it."""
+    seen = {}
+    for d in [e.dest for e in entries] + [d for o in options for d in o.dests]:
+        first = seen.get(d.lower())
+        if first is not None:
+            how = "" if first == d else f" (one file with {first!r} on a case-insensitive filesystem)"
+            raise ValueError(f"two entries install to {d!r}{how}")
+        seen[d.lower()] = d
+
+
+def _check_names(pool, bundles):
+    """Bundle names and loose entry/variant names share ONE namespace, so they are checked in one
+    pass (B8, widened).
+
+    Every `name` in the document -- a bundle's or a loose asset's -- is the filename of a file
+    uploaded to the SAME GitHub release, and an entry resolves to bytes by looking that name up.
+    Two assets cannot hold one name there, so the second upload either fails the publish or answers
+    for both entries. B8 only ever compared bundle names against EACH OTHER, and a loose `name` was
+    never uniqueness-checked at all, which left a bundle colliding with a raw asset invisible --
+    tools/build_game_bundles.py carries its own `taken` set and a hand-rolled "B8 violated" exit for
+    exactly that case, over names it minted itself. It is a property of the whole document, so it
+    belongs here, where the whole document is."""
+    seen = set()
+    for a in list(pool) + list(bundles):
+        if a.name is None:
+            continue
+        if a.name in seen:
+            raise ValueError(f"release asset name {a.name!r} is claimed twice (B8)")
+        seen.add(a.name)
+
+
+def _check_unbundled(pool, bundled_hashes):
     """B3: a positive-size asset with no `name` and whose sha256 is in no bundle has no route to
     bytes at all.
 
@@ -212,18 +313,20 @@ def _check_unbundled(entries, options, bundled_hashes):
     legitimately point two different Entry objects at two different `dest`s with ONE shared hash,
     stored once, inside a single bundle. Checking by object identity refused that legal shape;
     checking by hash accepts it, while B5 below still refuses the same hash claimed by two bundles."""
-    for a in _asset_pool(entries, options):
+    for a in pool:
         if a.size > 0 and a.name is None and a.sha256 not in bundled_hashes:
             where = getattr(a, "dest", None) or getattr(a, "id", "<entry>")
             raise ValueError(f"{where!r} has positive size, no `name`, and is in no bundle (B3)")
 
 
-def _check_bundles(entries, bundles, options):
-    """B8 (no two bundles share a name), the other half of B1 (a bundle can only pack an asset that
-    is actually reachable from `files[]` or an option -- otherwise its dest is unrecoverable, even
-    though manifest_schema.BUNDLE guarantees its `members` entry is never a stray hash), and B5.
+def _check_bundles(bundles, pool_ids):
+    """The other half of B1 (a bundle can only pack an asset that is actually reachable from
+    `files[]` or an option -- otherwise its dest is unrecoverable, even though
+    manifest_schema.BUNDLE guarantees its `members` entry is never a stray hash), and B5.
     Returns the set of every sha256 that legally belongs to exactly one bundle, for `_check_unbundled`
     (B3) to resolve entries against -- so B3 can never accept a hash this function would have refused.
+    (B8 used to be here as "no two BUNDLES share a name"; it moved to `_check_names`, which checks
+    the one namespace a bundle name actually lives in.)
 
     B5 is checked by HASH here, not left to Bundle.__init__'s per-OBJECT `_bundle` tracking, because
     that tracking alone misses two shapes: the identical Entry object listed twice in one bundle's
@@ -236,15 +339,10 @@ def _check_bundles(entries, bundles, options):
     known, catches both. The SAME hash reused between a bundle and a LOOSE entry is not this case at
     all -- see `_check_unbundled` -- and the same hash reused across several UNBUNDLED loose entries
     was never restricted either."""
-    pool = _asset_pool(entries, options)
-    names = set()
     seen_hashes = set()
     for b in bundles:
-        if b.name in names:
-            raise ValueError(f"duplicate bundle asset name {b.name!r} (B8)")
-        names.add(b.name)
         for e in b.entries:
-            if e not in pool:
+            if id(e) not in pool_ids:
                 raise ValueError(f"bundle {b.name!r} packs an entry absent from files[] and every "
                                  "option -- its dest would be unrecoverable (B1)")
             if e.sha256 in seen_hashes:
@@ -254,16 +352,16 @@ def _check_bundles(entries, bundles, options):
     return seen_hashes
 
 
-def _check_tree(tree, entries):
+def _check_tree(tree, entry_ids):
     """A tree reference must resolve to one of the manifest's OWN top-level entries. (Stricter than
     a reader has to be -- docs/manifest-reader-contract.md required a reader to treat a dangling ref
     as non-fatal, because a reader can be handed a manifest from an old or buggy producer. A
     producer has no such excuse: it wrote the entries itself, so here a dangling ref is refused.)"""
     for n in tree:
         for e in (n.files or ()):
-            if e not in entries:
+            if id(e) not in entry_ids:
                 raise ValueError(f"tree references dest {e.dest!r}, which is not in files[]")
-        _check_tree(n.groups or (), entries)
+        _check_tree(n.groups or (), entry_ids)
 
 
 # --- the public API ---------------------------------------------------------------------------
@@ -284,12 +382,21 @@ def build(payload_id, version, serial, entries, bundles=(), options=(), tree=Non
     options = list(options)
     tree = list(tree) if tree else []
 
-    # _check_bundles first: it both validates the bundles themselves (B1/B5/B8) and returns the
+    # The pool and its index are built ONCE here and handed down; every check below is a question
+    # about the same set of objects, and this local is what keeps them alive for as long as the
+    # index's id()s stand for them (see _id_index). Building the pool is also what refuses an
+    # option whose `kind` is outside the union, before anything renders.
+    pool = _asset_pool(entries, options)
+    pool_ids = _id_index(pool)
+
+    # _check_bundles first: it both validates the bundles themselves (B1/B5) and returns the
     # hash set _check_unbundled (B3) resolves entries against -- so B3 can only ever accept a hash
     # that has already been proven to belong to exactly one bundle.
-    bundled_hashes = _check_bundles(entries, bundles, options)
-    _check_unbundled(entries, options, bundled_hashes)
-    _check_tree(tree, entries)
+    bundled_hashes = _check_bundles(bundles, pool_ids)
+    _check_unbundled(pool, bundled_hashes)
+    _check_names(pool, bundles)
+    _check_dests(entries, options)
+    _check_tree(tree, _id_index(entries))
 
     class _Doc:
         pass
@@ -709,6 +816,73 @@ def _selftest():
     refused("the same entry object listed twice in one bundle, via the game producer's shape "
             "-- still B5, REFUSE", shared_hash_same_object_twice_one_bundle)
 
+    # --- the dest namespace: one installed file per path ------------------------------------
+
+    def duplicate_dest():
+        a = entry("game/dota/a.txt", sha("a"), 10, name="a.txt")
+        b = entry("game/dota/a.txt", sha("b"), 20, name="b.txt")
+        build("mod", "1.0.0", _TEST_SERIAL, [a, b])
+
+    def case_only_dest_collision():
+        # Two entries that pass every field rule AND the reader's own check_dest, naming one file
+        # on the only filesystem this installs onto -- whichever lands last wins, and the other's
+        # bytes were downloaded to be overwritten.
+        a = entry("game/dota/A.txt", sha("a"), 10, name="a.txt")
+        b = entry("game/dota/a.txt", sha("b"), 20, name="b.txt")
+        build("mod", "1.0.0", _TEST_SERIAL, [a, b])
+
+    def option_dest_collides_with_a_file():
+        e = entry("game/dota_phoenix/maps/dota.vpk", sha("core"), 10, name="core.vpk")
+        v = Variant("mod", "Mod", sha("v"), 10, name="v.vpk")
+        opt = Choice("lighting", "Lighting", v, "game/dota_phoenix/maps/dota.vpk", [v])
+        build("mod", "1.0.0", _TEST_SERIAL, [e], options=[opt])
+
+    def variants_share_their_option_dest():
+        # The ACCEPTING direction, and the reason the dest pool takes a choice's own dest rather
+        # than one per variant: variants are mutually exclusive, so counting each as a claim on
+        # that dest would refuse every choice ever shipped.
+        v1 = Variant("mod", "Mod", sha("v1"), 10, name="v1.vpk")
+        v2 = Variant("original", "Original", sha("v2"), 20, name="v2.vpk")
+        e = entry("game/dota/a.txt", sha("a"), 10, name="a.txt")
+        opt = Choice("lighting", "Lighting", v2, "game/dota_phoenix/maps/dota.vpk", [v1, v2])
+        doc = build("mod", "1.0.0", _TEST_SERIAL, [e], options=[opt])
+        assert_(doc["options"][0]["dest"] == "game/dota_phoenix/maps/dota.vpk", "the option's dest")
+
+    def dests_differing_by_one_legal_character():
+        # Only CASE folds. '-' and '_' are different characters and different files, so a fold any
+        # wider than the filesystem's own would refuse a legal pair like this one.
+        a = entry("game/dota/a-b.txt", sha("a"), 10, name="a-b.txt")
+        b = entry("game/dota/a_b.txt", sha("b"), 20, name="a_b.txt")
+        doc = build("mod", "1.0.0", _TEST_SERIAL, [a, b])
+        assert_(len(doc["files"]) == 2, "both entries survive")
+
+    refused("two entries installing to the same dest", duplicate_dest)
+    refused("two dests differing only in case -- one file on Windows", case_only_dest_collision)
+    refused("a choice's dest colliding with a top-level entry's", option_dest_collides_with_a_file)
+    ok("a choice's variants sharing their option's one dest -- ACCEPT",
+       variants_share_their_option_dest)
+    ok("two dests differing by a legal character ('-' vs '_') -- ACCEPT",
+       dests_differing_by_one_legal_character)
+
+    # --- the release-asset namespace: bundle names and loose names are ONE set --------------
+
+    def bundle_name_collides_with_a_loose_asset():
+        # The hole tools/build_game_bundles.py patches with its own `taken` set: B8 compared bundle
+        # names only against each other, and a loose `name` was never uniqueness-checked at all.
+        loose = entry("game/dota/a.txt", sha("a"), 10, name="mod-4f3a91c2e5d8.phxb")
+        packed = entry("game/dota/b.txt", sha("b"), 20)
+        bun = Bundle("mod-4f3a91c2e5d8.phxb", "zstd", 5, sha("p"), entries=[packed])
+        build("mod", "1.0.0", _TEST_SERIAL, [loose, packed], bundles=[bun])
+
+    def two_loose_entries_sharing_one_name():
+        a = entry("game/dota/a.txt", sha("a"), 10, name="same.vpk")
+        b = entry("game/dota/b.txt", sha("b"), 20, name="same.vpk")
+        build("mod", "1.0.0", _TEST_SERIAL, [a, b])
+
+    refused("a bundle name colliding with a loose entry's name (B8, widened)",
+            bundle_name_collides_with_a_loose_asset)
+    refused("two loose entries claiming one release asset name", two_loose_entries_sharing_one_name)
+
     # --- a name GitHub would rewrite is not a name --------------------------------------
 
     def with_name(n):
@@ -791,6 +965,18 @@ def _selftest():
     refused("a size above the u64 the wire carries", size_above_u64)
     ok("a serial of exactly u64 max -- the boundary is legal, ACCEPT", serial_at_the_ceiling)
     refused("a manifest with an empty files[]", no_files_at_all)
+
+    # --- the option union is closed, and dispatched once -----------------------------------------
+
+    def an_option_kind_outside_the_union():
+        # Refused BY NAME, where the asset pool is built -- this used to reach the walk's
+        # `OPTION[kind]` and come out as a KeyError, which is not a format complaint at all.
+        class Skin:
+            kind, id = "skin", "skin"
+        e = entry("game/dota/a.bin", sha("a"), 10, name="a.bin")
+        build("mod", "1.0.0", _TEST_SERIAL, [e], options=[Skin()])
+
+    refused("an option whose kind is outside the format's union", an_option_kind_outside_the_union)
 
     for good, name, detail in results:
         print(f"  {'ok  ' if good else 'FAIL'} {name}" + (f"\n         {detail}" if detail else ""))
