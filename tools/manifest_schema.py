@@ -360,9 +360,10 @@ MANIFEST = Obj(
     payload_id=Enum(*PAYLOAD_IDS),
     # The SOLE ordering authority within one payload line -- `version` is display text and is never
     # compared -- and what a client ratchets against: a manifest below the serial it already holds
-    # is refused. Int(min=0) is the whole of what the FORMAT can say about it. WHICH number comes
-    # next is the publisher's business, and tools/next_serial.py answers it by reading the last
-    # PUBLISHED manifest and adding one. A SERIAL_FLOOR (2_000_000) used to sit here instead,
+    # is refused. Int(min=0) is the whole of what the FORMAT can say about it: any strictly
+    # increasing sequence satisfies the contract, so WHICH number comes next is the publisher's
+    # business and is decided by each producer -- in its own release workflow, or by hand for the
+    # base game -- never here. A SERIAL_FLOOR (2_000_000) used to sit here instead,
     # encoding one producer's `2000000 + github.run_number` convention into the format: it caught
     # nothing real -- a run counter reset by a renamed workflow yields 2000001, which clears the
     # floor and still lands below every installed client's ratchet, so the release is invisible to

@@ -432,9 +432,9 @@ def write(path, payload_id, version, serial, entries, bundles=(), options=(), tr
 # --- selftest -----------------------------------------------------------------------------------
 
 # A serial for every case where the NUMBER itself is beside the point. The format's only rule about
-# one is Int(min=0); which value a real release carries is decided by tools/next_serial.py, from the
-# last manifest actually published. Shaped like a real one so a failure message reads like a real
-# document rather than a toy.
+# one is Int(min=0); which value a real release carries is each producer's own decision, made where
+# it publishes. Shaped like a real one so a failure message reads like a real document rather than
+# a toy.
 _TEST_SERIAL = 2_000_001
 
 
