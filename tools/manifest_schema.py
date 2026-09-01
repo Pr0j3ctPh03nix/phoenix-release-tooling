@@ -2,10 +2,10 @@
 
 Nothing here builds a document -- see build_manifest.py for that. This module answers only "what
 does the wire format look like and what does each field mean", as a small vocabulary of field types
-(Const, Enum, Int, Str, Hex64, Dest, Label, Opt, List, Obj, Derived, Ref) composed into the five
-named shapes below (FILE, BUNDLE, NODE, OPTION, MANIFEST). Adding or changing a wire field is meant
-to be a ONE-FILE edit here; build_manifest.py's builder walks whatever this module declares and
-hardcodes no key name of its own.
+(Const, Enum, Int, Str, AssetName, Hex64, Dest, Label, Opt, List, Obj, Derived, Ref) composed into
+the five named shapes below (FILE, BUNDLE, NODE, OPTION, MANIFEST). Adding or changing a wire field
+is meant to be a ONE-FILE edit here; build_manifest.py's builder walks whatever this module declares
+and hardcodes no key name of its own.
 
 Two kinds of field carry no input from a caller at all:
 
@@ -41,6 +41,19 @@ SCHEMA = 3
 PAYLOAD_IDS = ("mod", "launcher", "game")
 
 CODECS = ("zstd",)
+
+# The sha256 of zero bytes. Every reader resolves an entry to bytes by `size` FIRST -- size 0 means
+# "materialize an empty file", no asset, no bundle -- so the hash on such an entry is never used to
+# fetch anything and a wrong one is invisible until some other tool trusts it. The format ties the
+# two together in BOTH directions; the check is in build_manifest.Asset, the one place a size and a
+# sha256 arrive together.
+EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+# Every number this format carries is a u64 on the wire, and a reader parses each into one (the
+# launcher's `size`/`psize` are u64; `schema`/`serial` go through as_u64). Python's int has no such
+# ceiling, so an arithmetic slip -- a serial derived by multiplication, a size read from a 64-bit
+# field as unsigned when it was meant as signed -- renders a number no reader can parse back.
+U64_MAX = (1 << 64) - 1
 
 # The reference zstd decoder's default ZSTD_d_windowLogMax -- a bundle built at a higher window log
 # would need a reader to raise its own limit, so this is a wire-format ceiling, not a tuning knob.
@@ -85,15 +98,19 @@ class Enum:
 
 
 class Int:
-    """A whole number, optionally floored. Rejects `bool` explicitly for the reason above."""
-    def __init__(self, min=None):
-        self.min = min
+    """A whole number, optionally floored, and ALWAYS ceilinged at U64_MAX -- see that constant:
+    the ceiling is the wire type itself, not a per-field opinion, so a field declared here cannot
+    forget it. Rejects `bool` explicitly for the reason above."""
+    def __init__(self, min=None, max=U64_MAX):
+        self.min, self.max = min, max
 
     def render(self, value):
         if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError(f"{value!r} is not a whole number")
         if self.min is not None and value < self.min:
             raise ValueError(f"{value} is below the minimum {self.min}")
+        if value > self.max:
+            raise ValueError(f"{value} is above the maximum {self.max}")
         return value
 
 
@@ -102,6 +119,29 @@ class Str:
     def render(self, value):
         if not isinstance(value, str) or not value:
             raise TypeError(f"{value!r} is not a non-empty string")
+        return value
+
+
+class AssetName:
+    """The name of a release asset -- restricted to what GitHub stores UNCHANGED.
+
+    A `name` is not free text: it is the filename the asset was uploaded under, and the only thing
+    that maps a manifest entry to bytes on the release. GitHub silently REWRITES a name it dislikes
+    (spaces and non-ASCII become something else), and the manifest keeps the name that was asked
+    for -- so the entry then points at an asset that does not exist, on a release that uploaded
+    fine. `tools/build_game_bundles.py` carries a whole `asset_name()` sanitizer for exactly this,
+    minting `[A-Za-z0-9._-]`; tools/phxb.py's bundle names (`<label>-<psha[:12]>.phxb`) already
+    live in the same set. This is that rule stated where the format is, so a producer that does not
+    sanitize cannot ship a name only GitHub gets to see the real version of."""
+    _OK = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+
+    def render(self, value):
+        if not isinstance(value, str) or not value:
+            raise TypeError(f"{value!r} is not a non-empty string")
+        bad = sorted({c for c in value if c not in self._OK})
+        if bad:
+            raise ValueError(f"{value!r}: {''.join(bad)!r} -- a release asset name may hold only "
+                             "ASCII letters, digits, '.', '_' and '-' (GitHub rewrites the rest)")
         return value
 
 
@@ -131,7 +171,25 @@ class Dest:
         against `unsafe_dest` alone could emit a manifest the launcher then rejects at install time.
         Refusing it here closes that gap now that this is the one definition of a legal dest.
 
-    Losing no rule from the port does not mean adding no rule to it."""
+    Losing no rule from the port does not mean adding no rule to it. Three more are WIN32 FACTS
+    about what a path resolves to, all of them in the per-component loop below: Win32 trims trailing
+    spaces and dots off each component BEFORE resolving it, a `.` component is not part of the path
+    at all, and a reserved device name is not a file whatever extension follows it. Each one makes a
+    dest that reads as one thing install as another -- or as nothing.
+
+    There is deliberately NO length rule. The Win32 limit applies to the whole path, and the whole
+    path is the game root plus this -- the root is the user's, unknown here and unknowable at build
+    time, so any ceiling this module named would be a guess in both directions. The reader joins the
+    two and is the only thing that can weigh them."""
+    # Trailing space/dot trimmed first (see below), then the stem before the first '.': `NUL `,
+    # `nul.txt` and `NUL.tar.gz` all name the device. COM/LPT take any single digit, matching the
+    # reader's own set (its `is_reserved_device` tests `is_ascii_digit`, so COM0/LPT0 are refused
+    # there too) -- a dest this module allows and the launcher then refuses is the exact
+    # buildable-but-uninstallable gap these rules exist to close.
+    _DEVICES = frozenset(("con", "prn", "aux", "nul")
+                         + tuple(f"com{d}" for d in "0123456789")
+                         + tuple(f"lpt{d}" for d in "0123456789"))
+
     def render(self, value):
         if not isinstance(value, str) or not value:
             raise ValueError("dest must be a non-empty string")
@@ -146,6 +204,17 @@ class Dest:
             raise ValueError(f"{value!r}: empty path component (a doubled or trailing '/')")
         if ".." in parts:
             raise ValueError(f"{value!r}: '..' escapes the game root")
+        for p in parts:
+            if p == ".":
+                raise ValueError(f"{value!r}: a '.' component -- it normalizes away, so this dest "
+                                 "is not the string it installs to")
+            if p != p.rstrip(" ."):
+                raise ValueError(f"{value!r}: component {p!r} ends in a space or a dot, which "
+                                 "Win32 strips before resolving -- the file it names is the "
+                                 "TRIMMED one, so two dests that differ only there are one file")
+            if p.split(".")[0].lower() in self._DEVICES:
+                raise ValueError(f"{value!r}: component {p!r} is a reserved device name -- "
+                                 "writing it opens the device, not a file")
         return value
 
 
@@ -169,11 +238,14 @@ class Opt:
 
 
 class List:
-    """Zero or more of `inner`, in order. Order is meaningful for bundle-derived fields (a bundle
+    """`min` or more of `inner`, in order. Order is meaningful for bundle-derived fields (a bundle
     splits its decoded stream by counting bytes against its members IN ORDER) and cosmetic
-    everywhere else."""
-    def __init__(self, inner):
-        self.inner = inner
+    everywhere else.
+
+    `min` exists for one list that must not be empty -- see MANIFEST.files. Enforced by the walk
+    (build_manifest._value), which is what interprets List at all."""
+    def __init__(self, inner, min=0):
+        self.inner, self.min = inner, min
 
 
 class Obj:
@@ -210,7 +282,7 @@ class Ref:
 # present only for a LOOSE entry (its own release asset); absent, it is a bundle member instead --
 # build_manifest.py's Entry/Bundle enforce that this is the only two states an entry can be in.
 FILE = Obj(
-    name=Opt(Str()),
+    name=Opt(AssetName()),
     dest=Dest(),
     sha256=Hex64(),
     size=Int(min=0),
@@ -221,7 +293,7 @@ FILE = Obj(
 VARIANT = Obj(
     id=Str(),
     label=Label(),
-    name=Opt(Str()),
+    name=Opt(AssetName()),
     sha256=Hex64(),
     size=Int(min=0),
 )
@@ -230,7 +302,7 @@ VARIANT = Obj(
 # see build_manifest.Bundle -- so a size-sum mismatch or an orphan member cannot be expressed; there
 # is no field here a caller can set directly for either.
 BUNDLE = Obj(
-    name=Str(),
+    name=AssetName(),
     codec=Enum(*CODECS),
     psize=Int(min=0),
     psha256=Hex64(),
@@ -302,7 +374,11 @@ MANIFEST = Obj(
     version=Str(),
     notes=Opt(Str()),
     bundles=Opt(List(BUNDLE)),
-    files=List(FILE),
+    # At least one. A release that installs NOTHING is not a release: every client compares serials,
+    # sees a newer one, downloads it, installs zero files and reports itself up to date -- and the
+    # producer sees a green build. That is what a glob matching nothing looks like from both ends,
+    # and the only place it can be caught is here, before the document is signed.
+    files=List(FILE, min=1),
     # A known, permanent gap (see the old docs/manifest-reader-contract.md, and every producer that
     # ever existed): nothing here can populate a removal, so a retired file's old dest is orphaned
     # forever. Encoding that honestly -- always empty, never a caller argument -- beats silently

@@ -62,8 +62,21 @@ class Asset:
     """A file-bearing thing: either a LOOSE release asset (carries `name`) or a bundle member --
     never neither (unless `size` is 0, which resolves by being materialized empty and needs neither),
     never both. `_bundle` is set exactly once, by Bundle(), which is what makes "in two bundles at
-    once" and "a named entry inside a bundle" impossible to construct rather than merely wrong."""
+    once" and "a named entry inside a bundle" impossible to construct rather than merely wrong.
+
+    `size` and `sha256` are the one PAIR of wire fields whose values constrain each other, and this
+    is the only place both arrive together -- no single field type can see the other. Zero bytes
+    hash to exactly one value (manifest_schema.EMPTY_SHA256) and nothing else does, so the two say
+    the same thing twice and a reader that reads only one of them still has to be right: `size` 0
+    short-circuits to "materialize an empty file" without ever fetching the bytes the hash names,
+    while a hash-keyed cache (the launcher stores by sha256) would hand the empty file's slot to a
+    108 MB entry. Both directions, or the disagreement just moves."""
     def __init__(self, sha256, size, name=None):
+        if size == 0 and sha256 != schema.EMPTY_SHA256:
+            raise ValueError(f"a zero-size entry must carry the sha256 of zero bytes, not "
+                             f"{sha256[:12] if isinstance(sha256, str) else sha256!r}")
+        if size != 0 and sha256 == schema.EMPTY_SHA256:
+            raise ValueError(f"size {size} with the sha256 of zero bytes -- one of the two is wrong")
         self.sha256, self.size, self.name = sha256, size, name
         self._bundle = None
 
@@ -153,6 +166,8 @@ def _value(field, raw):
     if isinstance(field, schema.Opt):
         return schema.ABSENT if raw is None else _value(field.inner, raw)
     if isinstance(field, schema.List):
+        if len(raw) < field.min:
+            raise ValueError(f"a list of {len(raw)} where the format requires at least {field.min}")
         return [_value(field.inner, item) for item in raw]
     if isinstance(field, schema.Obj):
         return _render_obj(field, raw)
@@ -632,7 +647,9 @@ def _selftest():
         Choice("opt", "Opt", stray, "game/dota/opt.bin", [v1, v2])
 
     def zero_size_bundle_member():
-        e = entry("game/dota/empty.marker", sha("empty"), 0)
+        # The real empty hash, not a stand-in: Asset now refuses size 0 with any other hash, and a
+        # stand-in would make this case fail for THAT reason and stop exercising B6 at all.
+        e = entry("game/dota/empty.marker", schema.EMPTY_SHA256, 0)
         Bundle("b-x.phxb", "zstd", 0, sha("p"), entries=[e])
 
     def named_entry_bundled():
@@ -691,6 +708,89 @@ def _selftest():
             shared_hash_two_different_bundles)
     refused("the same entry object listed twice in one bundle, via the game producer's shape "
             "-- still B5, REFUSE", shared_hash_same_object_twice_one_bundle)
+
+    # --- a name GitHub would rewrite is not a name --------------------------------------
+
+    def with_name(n):
+        e = entry("game/dota/a.bin", sha("a"), 10, name=n)
+        build("mod", "1.0.0", _TEST_SERIAL, [e])
+
+    def the_names_producers_actually_mint():
+        # Both shapes in one document, because refusing either would break a shipping producer:
+        # build_game_bundles.asset_name() ('/' -> '__', everything else outside [A-Za-z0-9._-] -> '_')
+        # and phxb.build_bundle's content-addressed `<label>-<psha[:12]>.phxb`.
+        loose = entry("game/dota/scripts/npc/npc_units.txt", sha("npc"), 10,
+                      name="game__dota__scripts__npc__npc_units.txt")
+        packed = entry("game/dota/b.txt", sha("b"), 20)
+        bun = Bundle("b000-txt-4f3a91c2e5d8.phxb", "zstd", 5, sha("p"), entries=[packed])
+        doc = build("game", "1805", _TEST_SERIAL, [loose, packed], bundles=[bun])
+        assert_(doc["files"][0]["name"] == "game__dota__scripts__npc__npc_units.txt", "loose name")
+        assert_(doc["bundles"][0]["name"] == "b000-txt-4f3a91c2e5d8.phxb", "bundle name")
+
+    refused("an asset name with a space", lambda: with_name("hero demo.vpk"))
+    refused("a non-ASCII asset name", lambda: with_name("оружие.vpk"))
+    ok("the names both producers really mint (asset_name()'s and phxb's) -- ACCEPT",
+       the_names_producers_actually_mint)
+
+    # --- dests Win32 does not resolve to what they say -------------------------------------
+
+    def dest_merely_containing_a_device_name():
+        # The ACCEPTING direction: the device is the whole stem, never a prefix of one, so these
+        # three ordinary files must still build.
+        for d in ("game/dota/console.log", "game/dota/nulls.txt", "game/dota/aux_scripts/x.txt"):
+            build("mod", "1.0.0", _TEST_SERIAL, [entry(d, sha(d), 10, name="x.bin")])
+
+    refused("a dest component ending in a dot", lambda: with_dest("game/dota/a.txt."))
+    refused("a dest component ending in a space", lambda: with_dest("game/dota/a.txt "))
+    refused("a '.' dest component", lambda: with_dest("game/./a.txt"))
+    refused("a reserved device name as a dest component", lambda: with_dest("game/dota/NUL"))
+    refused("a reserved device name wearing an extension", lambda: with_dest("game/dota/COM1.cfg"))
+    ok("dests that merely contain a device name ('console.log', 'nulls.txt') -- ACCEPT",
+       dest_merely_containing_a_device_name)
+
+    # --- size and sha256 state the same fact, and must agree -------------------------------
+
+    def zero_size_with_a_content_hash():
+        entry("game/dota/empty.marker", sha("something"), 0)
+
+    def positive_size_with_the_empty_hash():
+        entry("game/dota/a.bin", schema.EMPTY_SHA256, 10, name="a.bin")
+
+    def the_empty_entry_agreeing():
+        e = entry("game/dota/empty.marker", schema.EMPTY_SHA256, 0)
+        doc = build("mod", "1.0.0", _TEST_SERIAL, [e])
+        assert_(doc["files"] == [{"dest": "game/dota/empty.marker",
+                                  "sha256": schema.EMPTY_SHA256, "size": 0}], "the empty entry")
+
+    refused("a zero-size entry carrying a content hash", zero_size_with_a_content_hash)
+    refused("a positive-size entry carrying the hash of zero bytes", positive_size_with_the_empty_hash)
+    ok("size 0 with the hash of zero bytes -- the one agreeing pair, ACCEPT", the_empty_entry_agreeing)
+
+    # --- the wire's own limits: a u64 ceiling, and a files[] with something in it ---------------
+
+    def serial_above_u64():
+        e = entry("game/dota/a.bin", sha("a"), 10, name="a.bin")
+        build("mod", "1.0.0", schema.U64_MAX + 1, [e])
+
+    def size_above_u64():
+        e = entry("game/dota/a.bin", sha("a"), schema.U64_MAX + 1, name="a.bin")
+        build("mod", "1.0.0", _TEST_SERIAL, [e])
+
+    def serial_at_the_ceiling():
+        e = entry("game/dota/a.bin", sha("a"), 10, name="a.bin")
+        doc = build("mod", "1.0.0", schema.U64_MAX, [e])
+        assert_(doc["serial"] == schema.U64_MAX, "the ceiling itself is a legal serial")
+
+    def no_files_at_all():
+        # What a glob that matched nothing produces: a document that signs, publishes and installs
+        # nothing, while every client that fetches it reports itself up to date. (The accepting
+        # direction is every other case here -- `launcher_shaped` is a files[] of exactly one.)
+        build("mod", "1.0.0", _TEST_SERIAL, [])
+
+    refused("a serial above the u64 the wire carries", serial_above_u64)
+    refused("a size above the u64 the wire carries", size_above_u64)
+    ok("a serial of exactly u64 max -- the boundary is legal, ACCEPT", serial_at_the_ceiling)
+    refused("a manifest with an empty files[]", no_files_at_all)
 
     for good, name, detail in results:
         print(f"  {'ok  ' if good else 'FAIL'} {name}" + (f"\n         {detail}" if detail else ""))
