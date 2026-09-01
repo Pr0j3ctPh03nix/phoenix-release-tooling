@@ -219,13 +219,25 @@ def _serial_after(release, fetch, seed):
     """The rule itself, with the network pushed out into `fetch(url) -> bytes`.
 
     `release` is the latest release document, or None for "the repository is visible and has no
-    releases". Both seed paths and the "a fetch that failed is never a seed" path live here, which
-    is exactly why they are reachable without a network: `fetch` raising propagates untouched."""
+    releases". That None is the ONLY seed path, and the "a fetch that failed is never a seed" path
+    lives here too, which is exactly why both are reachable without a network: `fetch` raising
+    propagates untouched.
+
+    A latest release that carries no manifest.json does NOT seed. A release that EXISTS is not
+    evidence that the payload line has not started -- it may have been published by hand, or be an
+    older release from before this payload was signed, or be one whose asset upload failed halfway
+    -- and seeding there restarts numbering below the ratchet every installed client already holds,
+    which is the exact failure this module exists to prevent. Having no releases AT ALL is the only
+    state that is a fact about the line, so it is the only one that mints a seed."""
     if release is None:
         return seed
     url = _manifest_asset(release)
     if url is None:
-        return seed
+        raise SerialError(
+            f"the latest release carries no {MANIFEST_ASSET} -- refusing to seed, because a "
+            "release that exists is not evidence that this payload line has not started. Only a "
+            "repository with no releases at all is that. If this really is a new line, publish the "
+            "first release with an explicit serial.")
     return serial_of(_json(fetch(url), MANIFEST_ASSET)) + 1
 
 
@@ -263,9 +275,9 @@ def _latest_release(repo, token):
 def next_serial(repo, token=None, seed=1):
     """-> the serial the next release of `repo`'s payload should carry.
 
-    `seed` for a repository that is visible and has published nothing yet (or whose latest release
-    carries no manifest.json); SerialError for everything else, including every way the question
-    could not be answered. `token` is optional: a public repository needs none."""
+    `seed` for a repository that is visible and has published nothing at all; SerialError for
+    everything else, including every way the question could not be answered, and including a latest
+    release that carries no manifest.json. `token` is optional: a public repository needs none."""
     release = _latest_release(repo, token)
     return _serial_after(release, lambda url: _get(url, token, "application/octet-stream"), seed)
 
@@ -363,14 +375,18 @@ def _selftest():
        lambda: assert_(_serial_after(None, never_fetch, 1) == 1, "not the seed"))
     ok("a non-default seed is what a first release gets",
        lambda: assert_(_serial_after(None, never_fetch, 2000001) == 2000001, "not the seed"))
-    ok("a latest release carrying no manifest.json yields the seed",
-       lambda: assert_(_serial_after({"assets": [{"name": "phoenix-launcher.exe", "url": "u"}]},
-                                     never_fetch, 7) == 7, "not the seed"))
+    # A release that EXISTS but carries no manifest is NOT the seed: it may be a hand-made release,
+    # or one from before this payload was signed, and seeding there restarts the line below every
+    # installed client's ratchet. Only "no releases at all" is a fact about the line.
+    refused("a latest release carrying no manifest.json refuses rather than seeding",
+            lambda: _serial_after({"assets": [{"name": "phoenix-launcher.exe", "url": "u"}]},
+                                  never_fetch, 7))
     # The signature sits beside the document in every release; a loose match would read one for the
-    # other, and .minisig is not a JSON document at all.
-    ok("manifest.json.minisig alone is not a manifest",
-       lambda: assert_(_serial_after({"assets": [{"name": "manifest.json.minisig", "url": "u"}]},
-                                     never_fetch, 7) == 7, "matched the signature file"))
+    # other, and .minisig is not a JSON document at all. `never_fetch` is what proves the match was
+    # not made: matching it would try to download, and that raises AssertionError, not SerialError.
+    refused("manifest.json.minisig alone is not a manifest",
+            lambda: _serial_after({"assets": [{"name": "manifest.json.minisig", "url": "u"}]},
+                                  never_fetch, 7))
 
     # --- 4. a release that HAS a manifest: the right asset, by its API url ---------------------
 
