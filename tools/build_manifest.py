@@ -309,6 +309,13 @@ def write(path, payload_id, version, serial, entries, bundles=(), options=(), tr
 
 # --- selftest -----------------------------------------------------------------------------------
 
+# A serial for every case where the NUMBER itself is beside the point. The format's only rule about
+# one is Int(min=0); which value a real release carries is decided by tools/next_serial.py, from the
+# last manifest actually published. Shaped like a real one so a failure message reads like a real
+# document rather than a toy.
+_TEST_SERIAL = 2_000_001
+
+
 def _selftest():
     results = []
 
@@ -382,10 +389,12 @@ def _selftest():
                   False, [terrain_file]),
         ]
 
-        # current.json's own fixture serial (42) predates SERIAL_FLOOR -- it is a READER conformance
-        # fixture, not a document any current producer could emit. Everything else about it (every
-        # dest, hash, size, label and the nesting they sit in) is reproduced exactly.
-        serial = schema.SERIAL_FLOOR + 42
+        # current.json's own fixture serial. It used to be unreachable here -- 42 sat below the
+        # SERIAL_FLOOR the format then imposed, so this case had to carry a stand-in; with the floor
+        # gone (Int(min=0) is the whole rule now), the fixture's own number is expressible again and
+        # this reproduces it exactly, as it already does every dest, hash, size, label and the
+        # nesting they sit in.
+        serial = 42
         doc = build("mod", "1.0.0", serial, [pak, npc, hero, client, empty], bundles=[b000, b001],
                     options=options, tree=tree,
                     notes="### Added\n- Something a player can see.")
@@ -467,12 +476,12 @@ def _selftest():
     def schema_with_bundles():
         e = entry("game/dota/a.bin", sha("a"), 10)
         b = Bundle("b-x.phxb", "zstd", 5, sha("packed"), entries=[e])
-        doc = build("mod", "1.0.0", schema.SERIAL_FLOOR, [e], bundles=[b])
+        doc = build("mod", "1.0.0", _TEST_SERIAL, [e], bundles=[b])
         assert_(doc["schema"] == 3, f"expected schema 3, got {doc['schema']}")
 
     def schema_without_bundles():
         e = entry("game/dota/a.bin", sha("a"), 10, name="a.bin")
-        doc = build("mod", "1.0.0", schema.SERIAL_FLOOR, [e])
+        doc = build("mod", "1.0.0", _TEST_SERIAL, [e])
         assert_(doc["schema"] == 2, f"expected schema 2, got {doc['schema']}")
 
     ok("schema derives to 3 with a bundle present", schema_with_bundles)
@@ -482,7 +491,7 @@ def _selftest():
 
     def with_dest(d):
         e = entry(d, sha("x"), 10, name="x.bin")
-        build("mod", "1.0.0", schema.SERIAL_FLOOR, [e])
+        build("mod", "1.0.0", _TEST_SERIAL, [e])
 
     refused("dest '..' escapes the game root", lambda: with_dest("game/../../evil.dll"))
     refused("dest with a leading '/' is absolute", lambda: with_dest("/game/evil.dll"))
@@ -492,28 +501,31 @@ def _selftest():
             lambda: with_dest("game/dota//evil.dll"))
     refused("dest with a trailing '/'", lambda: with_dest("game/dota/evil.dll/"))
 
-    # --- 4. bad sha256 / payload_id / codec / serial floor are each refused --------------------
+    # --- 4. bad sha256 / payload_id / codec / serial are each refused --------------------------
 
     def bad_sha():
         e = entry("game/dota/a.bin", "not-a-sha256", 10, name="a.bin")
-        build("mod", "1.0.0", schema.SERIAL_FLOOR, [e])
+        build("mod", "1.0.0", _TEST_SERIAL, [e])
 
     def bad_payload_id():
         e = entry("game/dota/a.bin", sha("a"), 10, name="a.bin")
-        build("skins", "1.0.0", schema.SERIAL_FLOOR, [e])
+        build("skins", "1.0.0", _TEST_SERIAL, [e])
 
     def bad_codec():
         e = entry("game/dota/a.bin", sha("a"), 10)
         b = Bundle("b-x.phxb", "brotli", 5, sha("packed"), entries=[e])
-        build("mod", "1.0.0", schema.SERIAL_FLOOR, [e], bundles=[b])
+        build("mod", "1.0.0", _TEST_SERIAL, [e], bundles=[b])
 
-    def serial_below_floor():
+    def serial_negative():
+        # The one thing Int(min=0) still guarantees about a serial now that SERIAL_FLOOR is gone:
+        # the wire type is a u64, so a negative number never came from a publisher counting -- it
+        # came from arithmetic that underflowed on the way here.
         e = entry("game/dota/a.bin", sha("a"), 10, name="a.bin")
-        build("mod", "1.0.0", schema.SERIAL_FLOOR - 1, [e])
+        build("mod", "1.0.0", -1, [e])
 
     def serial_is_bool():
-        # Python's bool is an int subclass (True == 1), so a floor/type check that only compares
-        # VALUE would silently accept this -- the same trap tools/validate_manifest.py named
+        # Python's bool is an int subclass (True == 1), so a check comparing only VALUE would let
+        # this through the minimum (`True >= 0`) -- the same trap tools/validate_manifest.py named
         # explicitly for `schema`/`serial`. Int.render() checks isinstance(..., bool) first.
         e = entry("game/dota/a.bin", sha("a"), 10, name="a.bin")
         build("mod", "1.0.0", True, [e])
@@ -521,7 +533,7 @@ def _selftest():
     refused("a malformed sha256", bad_sha)
     refused("a payload_id outside the closed set", bad_payload_id)
     refused("a codec this format does not define", bad_codec)
-    refused("a serial below SERIAL_FLOOR", serial_below_floor)
+    refused("a negative serial", serial_negative)
     refused("a serial that is `True` rather than an int", serial_is_bool)
 
     # --- 5. bundle membership is single, and a bundle cannot be empty --------------------------
@@ -539,7 +551,7 @@ def _selftest():
         # inspected before either assignment lands. Only build()'s hash scan catches it.
         e = entry("game/dota/a.bin", sha("a"), 10)
         b = Bundle("b-dup.phxb", "zstd", 5, sha("p"), entries=[e, e])
-        build("mod", "1.0.0", schema.SERIAL_FLOOR, [e], bundles=[b])
+        build("mod", "1.0.0", _TEST_SERIAL, [e], bundles=[b])
 
     def duplicate_hash_across_bundles():
         # Two DISTINCT objects -- identical content at two different dests is legal -- each placed
@@ -549,7 +561,7 @@ def _selftest():
         e2 = entry("game/dota/b.bin", sha("dup"), 10)
         b1 = Bundle("b-1.phxb", "zstd", 5, sha("p1"), entries=[e1])
         b2 = Bundle("b-2.phxb", "zstd", 5, sha("p2"), entries=[e2])
-        build("mod", "1.0.0", schema.SERIAL_FLOOR, [e1, e2], bundles=[b1, b2])
+        build("mod", "1.0.0", _TEST_SERIAL, [e1, e2], bundles=[b1, b2])
 
     refused("the same entry placed in two bundles", entry_in_two_bundles)
     refused("a bundle with no entries", empty_bundle)
@@ -561,7 +573,7 @@ def _selftest():
 
     def launcher_shaped():
         e = entry("phoenix-launcher.exe", sha("exe"), 12345678, name="phoenix-launcher.exe")
-        doc = build("launcher", "1.5.2", schema.SERIAL_FLOOR + 42, [e])
+        doc = build("launcher", "1.5.2", _TEST_SERIAL, [e])
         assert_(doc["schema"] == 2, "schema")
         assert_("bundles" not in doc, "bundles must be omitted, not empty")
         assert_("tree" not in doc, "tree must be omitted, not empty")
@@ -581,7 +593,7 @@ def _selftest():
         tmp_dir = tempfile.mkdtemp()
         path = os.path.join(tmp_dir, "manifest.json")
         before = int(time.time())
-        doc = write(path, "mod", "1.0.0", schema.SERIAL_FLOOR, [e])
+        doc = write(path, "mod", "1.0.0", _TEST_SERIAL, [e])
         after = int(time.time())
         assert_("signed_at" in doc, "write() must set signed_at")
         assert_(isinstance(doc["signed_at"], int) and not isinstance(doc["signed_at"], bool),
@@ -599,19 +611,19 @@ def _selftest():
 
     def unbundled_entry():
         e = entry("game/dota/a.bin", sha("a"), 10)   # no name, never bundled
-        build("mod", "1.0.0", schema.SERIAL_FLOOR, [e])
+        build("mod", "1.0.0", _TEST_SERIAL, [e])
 
     def duplicate_bundle_name():
         e1 = entry("game/dota/a.bin", sha("a"), 10)
         e2 = entry("game/dota/b.bin", sha("b"), 10)
         b1 = Bundle("same.phxb", "zstd", 5, sha("p1"), entries=[e1])
         b2 = Bundle("same.phxb", "zstd", 5, sha("p2"), entries=[e2])
-        build("mod", "1.0.0", schema.SERIAL_FLOOR, [e1, e2], bundles=[b1, b2])
+        build("mod", "1.0.0", _TEST_SERIAL, [e1, e2], bundles=[b1, b2])
 
     def dangling_tree_ref():
         shown = entry("game/dota/a.bin", sha("a"), 10, name="a.bin")
         ghost = entry("game/dota/ghost.bin", sha("ghost"), 10, name="ghost.bin")
-        build("mod", "1.0.0", schema.SERIAL_FLOOR, [shown], tree=[Node(files=[ghost])])
+        build("mod", "1.0.0", _TEST_SERIAL, [shown], tree=[Node(files=[ghost])])
 
     def default_not_a_variant():
         v1 = Variant("a", "A", sha("a"), 10, name="a.bin")
@@ -647,7 +659,7 @@ def _selftest():
         a = Entry(dest="game/dota/x.txt", sha256=h, size=10)
         b = Entry(dest="game/dota/copy/x.txt", sha256=h, size=10)
         bun = Bundle(name="b000.phxb", codec="zstd", psize=5, psha256=sha("packed"), entries=[a])
-        doc = build(payload_id="game", version="1805", serial=schema.SERIAL_FLOOR + 1,
+        doc = build(payload_id="game", version="1805", serial=_TEST_SERIAL,
                    entries=[a, b], bundles=[bun])
         assert_(doc["bundles"][0]["members"] == [h], "the bundle carries the hash once, not twice")
         b_out = next(f for f in doc["files"] if f["dest"] == "game/dota/copy/x.txt")
@@ -661,7 +673,7 @@ def _selftest():
         b = Entry(dest="game/dota/copy/x.txt", sha256=h, size=10)
         bun1 = Bundle(name="b000.phxb", codec="zstd", psize=5, psha256=sha("p1"), entries=[a])
         bun2 = Bundle(name="b001.phxb", codec="zstd", psize=5, psha256=sha("p2"), entries=[b])
-        build(payload_id="game", version="1805", serial=schema.SERIAL_FLOOR + 1,
+        build(payload_id="game", version="1805", serial=_TEST_SERIAL,
               entries=[a, b], bundles=[bun1, bun2])
 
     def shared_hash_same_object_twice_one_bundle():
@@ -670,7 +682,7 @@ def _selftest():
         h = sha("shared")
         a = Entry(dest="game/dota/x.txt", sha256=h, size=10)
         bun = Bundle(name="b000.phxb", codec="zstd", psize=5, psha256=sha("p"), entries=[a, a])
-        build(payload_id="game", version="1805", serial=schema.SERIAL_FLOOR + 1,
+        build(payload_id="game", version="1805", serial=_TEST_SERIAL,
               entries=[a], bundles=[bun])
 
     ok("one sha256, one bundled entry and one loose entry sharing it -- resolves, ACCEPT",

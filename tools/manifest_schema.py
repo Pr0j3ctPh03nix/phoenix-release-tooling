@@ -42,11 +42,6 @@ PAYLOAD_IDS = ("mod", "launcher", "game")
 
 CODECS = ("zstd",)
 
-# The CI floor: below this, a serial almost certainly came from a build counter that reset (a
-# renamed workflow, a fresh repo) rather than from a genuine republish. See build_manifest.py's
-# Int(min=SERIAL_FLOOR) use on `serial`.
-SERIAL_FLOOR = 2_000_000
-
 # The reference zstd decoder's default ZSTD_d_windowLogMax -- a bundle built at a higher window log
 # would need a reader to raise its own limit, so this is a wire-format ceiling, not a tuning knob.
 ZSTD_WLOG = 27
@@ -290,7 +285,16 @@ MANIFEST = Obj(
     # decides, and it decides from the DOCUMENT's own shape, never from a caller's say-so.
     schema=Derived(lambda m: SCHEMA if m.bundles else 2),
     payload_id=Enum(*PAYLOAD_IDS),
-    serial=Int(min=SERIAL_FLOOR),
+    # The SOLE ordering authority within one payload line -- `version` is display text and is never
+    # compared -- and what a client ratchets against: a manifest below the serial it already holds
+    # is refused. Int(min=0) is the whole of what the FORMAT can say about it. WHICH number comes
+    # next is the publisher's business, and tools/next_serial.py answers it by reading the last
+    # PUBLISHED manifest and adding one. A SERIAL_FLOOR (2_000_000) used to sit here instead,
+    # encoding one producer's `2000000 + github.run_number` convention into the format: it caught
+    # nothing real -- a run counter reset by a renamed workflow yields 2000001, which clears the
+    # floor and still lands below every installed client's ratchet, so the release is invisible to
+    # everyone who already has one -- while making this module know a thing about a producer's CI.
+    serial=Int(min=0),
     # Reads whatever build_manifest.py put on `owner.signed_at` -- None by default (build() alone
     # never touches the clock), the real timestamp once write() supplies one. ABSENT while it is
     # None, so the key is simply missing from a plain build() result, never `null`.
