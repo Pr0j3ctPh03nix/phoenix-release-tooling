@@ -34,11 +34,10 @@ install, the mirror list names hosts to download releases from. A ping grants no
 forged entry buys is an unauthenticated POST that the forger could have sent themselves. What IS
 enforced is that the entry is an HTTP URL at all: a `base_url` whose scheme is not http:// or
 https:// is refused WITHOUT a request, and a redirect is never followed. So no line in a downloaded
-document can make a release runner — the one holding the signing key — open anything but an HTTP
-request to the host it named.
+document can make a release runner open anything but an HTTP request to the host it named.
 
-Stdlib only, like everything here that is not the signer: this runs in that same key-holding job,
-and a `pip install` is an input that job does not need.
+Stdlib only, like everything here that is not the signer: this runs in release CI right after the
+sealed release is published, and a `pip install` is an input that pipeline does not need.
 """
 import argparse
 import json
@@ -232,6 +231,10 @@ def _fixture_server():
     import http.server
     import threading
 
+    class Fixture(http.server.HTTPServer):
+        seen: list
+        flaky: int
+
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_POST(self):
             self.server.seen.append(self.path)
@@ -251,10 +254,10 @@ def _fixture_server():
         # was supposed to be.
         do_GET = do_POST
 
-        def log_message(self, *args):
+        def log_message(self, format, *args):
             pass
 
-    srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)     # 127.0.0.1: no firewall prompt
+    srv = Fixture(("127.0.0.1", 0), Handler)     # 127.0.0.1: no firewall prompt
     srv.seen, srv.flaky = [], 0
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
