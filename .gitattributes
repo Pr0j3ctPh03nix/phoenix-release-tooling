@@ -4,3 +4,11 @@
 # far as git is concerned.
 *.minisig -text
 *.pub -text
+
+# Same rule, one step further out: a wheel in wheels/ is a zip whose sha256 is recorded in
+# wheels/SHA256SUMS and checked before it is trusted, so any rewriting at all destroys it. `binary`
+# rather than `-text` because there is no diff of a zip worth showing either.
+*.whl binary
+
+# SHA256SUMS is read back by tools/wheels_check.py, which writes it with LF and splits on "  ".
+wheels/SHA256SUMS -text
