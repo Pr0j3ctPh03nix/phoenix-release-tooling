@@ -429,6 +429,213 @@ def write(path, payload_id, version, serial, entries, bundles=(), options=(), tr
     return doc
 
 
+# --- reading a document back: the check the SIGNING AUTHORITY makes -------------------------------
+#
+# Sealing used to need no validate step, and the reason was structural: the job that signed a
+# manifest was the job that BUILT it, three lines earlier, through build() -- which cannot return a
+# document violating the format (see this module's docstring, and seal.py's). That argument holds
+# only while those are one job. They are not any more: the release key has left every payload repo's
+# CI, and the signing authority is handed BYTES by a requester it did not run (see
+# .github/workflows/seal.yml). Without a check on this side, that authority is an oracle that signs
+# whatever it is sent, with the one key every payload -- and the mirror list -- is trusted under.
+#
+# So the check is back, and it is deliberately NOT a second implementation of the format. The
+# deleted tools/validate_manifest.py was a hand-written copy of the rules, free to drift from the
+# producer's (manifest_schema.py's own docstring records the pair of PAYLOAD_IDS sets that did
+# exactly that). This instead REBUILDS: load the objects the document says it was built from, run
+# the one builder over them, and require the result to equal the document. Every rule is then
+# enforced by the code that already owns it -- field types, the cross-object checks, and every
+# Derived field (`schema`, a bundle's `size`/`members`, `remove`) recomputed from the contents
+# rather than believed. There is nothing here for a rule to drift FROM.
+
+
+def parse(raw):
+    """Manifest BYTES -> a document, strictly. Refuses what a lenient parser would accept.
+
+    DUPLICATE KEYS are the reason this is not a bare json.loads. A signature covers bytes, and two
+    parsers are free to disagree about which value `{"serial": 1, "serial": 9}` has -- Python and
+    serde_json both keep the last, but nothing makes them; a document whose meaning depends on the
+    reader is one nobody should sign. json's own decoder is silent about it, so the pairs hook is
+    what makes it an error. UTF-8 with no BOM, and a JSON object at the root: everything else is a
+    file that merely resembles a manifest."""
+    def no_duplicates(pairs):
+        seen = set()
+        for k, _ in pairs:
+            if k in seen:
+                raise ValueError(f"duplicate key {k!r} -- two readers may disagree about its value")
+            seen.add(k)
+        return dict(pairs)
+
+    if not isinstance(raw, (bytes, bytearray)):
+        raise TypeError("parse() takes the document's exact bytes")
+    try:
+        text = bytes(raw).decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise ValueError(f"not UTF-8: {e}") from None
+    doc = json.loads(text, object_pairs_hook=no_duplicates)
+    if not isinstance(doc, dict):
+        raise ValueError("not a manifest: the document's root is not a JSON object")
+    return doc
+
+
+def _get(obj, key, what):
+    if not isinstance(obj, dict):
+        raise ValueError(f"{what} is not a JSON object")
+    if key not in obj:
+        raise ValueError(f"{what} carries no {key!r}")
+    return obj[key]
+
+
+def _load_asset(cls, raw, what, **extra):
+    """One FILE- or VARIANT-shaped object -> an Entry/Variant. Keys the wire shape does not define
+    are not rejected here -- they simply do not survive the rebuild, and the comparison in
+    validate() names them."""
+    return cls(sha256=_get(raw, "sha256", what), size=_get(raw, "size", what),
+               name=raw.get("name"), **extra)
+
+
+def _load_option(raw, what):
+    kind = _get(raw, "kind", what)
+    if kind == "choice":
+        variants = [_load_asset(Variant, v, f"{what}.variants[{i}]",
+                                id=_get(v, "id", f"{what}.variants[{i}]"),
+                                label=_get(v, "label", f"{what}.variants[{i}]"))
+                    for i, v in enumerate(_get(raw, "variants", what))]
+        wanted = _get(raw, "default", what)
+        default = next((v for v in variants if v.id == wanted), None)
+        if default is None:
+            raise ValueError(f"{what}: default {wanted!r} names none of its own variants")
+        return Choice(_get(raw, "id", what), _get(raw, "label", what), default,
+                      _get(raw, "dest", what), variants)
+    if kind == "toggle":
+        files = [_load_asset(Entry, f, f"{what}.files[{i}]", dest=_get(f, "dest", f"{what}.files[{i}]"))
+                 for i, f in enumerate(_get(raw, "files", what))]
+        return Toggle(_get(raw, "id", what), _get(raw, "label", what),
+                      _get(raw, "default", what), files)
+    raise ValueError(f"{what}: unknown kind {kind!r} (the format defines {tuple(schema.OPTION)})")
+
+
+def _load_bundles(raw_bundles, entries, options):
+    """Bundles, packing the SAME objects the entries/options above produced.
+
+    A bundle's `members` are hashes, so this is where the wire's one indirection is resolved back
+    into objects -- by the reader's own rule (entry -> bytes: `name` first, else the bundle whose
+    members carry its sha256), which is why a NAMED asset is never a candidate. Where two unbundled
+    entries share one hash -- legal, and what content-keyed bundling relies on -- either object
+    stands for the pair, so the first is taken: they agree on the only field a bundle derives from
+    a member, its size, or the rebuilt `size` will not match and validate() refuses the document."""
+    by_hash = {}
+    for a in list(entries) + [a for o in options for a in o.assets]:
+        if a.name is None:
+            by_hash.setdefault(a.sha256, a)
+    out = []
+    for i, b in enumerate(raw_bundles):
+        what = f"bundles[{i}]"
+        packed = []
+        for h in _get(b, "members", what):
+            a = by_hash.get(h) if isinstance(h, str) else None
+            if a is None:
+                raise ValueError(f"{what}: member {h!r} is carried by no bundleable entry -- its "
+                                 "bytes would decode to a file with no dest")
+            packed.append(a)
+        out.append(Bundle(_get(b, "name", what), _get(b, "codec", what), _get(b, "psize", what),
+                          _get(b, "psha256", what), packed))
+    return out
+
+
+def _load_tree(raw_nodes, by_dest, what):
+    out = []
+    for i, n in enumerate(raw_nodes):
+        here = f"{what}[{i}]"
+        if not isinstance(n, dict):
+            raise ValueError(f"{here} is not a JSON object")
+        files = []
+        for d in n.get("files") or []:
+            e = by_dest.get(d) if isinstance(d, str) else None
+            if e is None:
+                raise ValueError(f"{here}: references dest {d!r}, which is not in files[]")
+            files.append(e)
+        out.append(Node(label=n.get("label"), files=files,
+                        groups=_load_tree(n.get("groups") or [], by_dest, f"{here}.groups")))
+    return out
+
+
+def load(doc):
+    """A wire document -> the build() arguments it says it was built from.
+
+    Nothing here decides whether the document is LEGAL -- build() does, over the objects this
+    returns. This only has to resolve the two things the wire states by reference (a bundle's
+    members, a tree's dests) back into the objects the input language uses, and to say plainly when
+    a reference names nothing."""
+    entries = [_load_asset(Entry, f, f"files[{i}]", dest=_get(f, "dest", f"files[{i}]"))
+               for i, f in enumerate(_get(doc, "files", "the manifest"))]
+    options = [_load_option(o, f"options[{i}]") for i, o in enumerate(doc.get("options") or [])]
+    return dict(
+        payload_id=_get(doc, "payload_id", "the manifest"),
+        version=_get(doc, "version", "the manifest"),
+        serial=_get(doc, "serial", "the manifest"),
+        entries=entries,
+        options=options,
+        bundles=_load_bundles(doc.get("bundles") or [], entries, options),
+        tree=_load_tree(doc.get("tree") or [], {e.dest: e for e in entries}, "tree"),
+        notes=doc.get("notes"),
+        signed_at=doc.get("signed_at"),
+    )
+
+
+def _short(value, limit=120):
+    text = repr(value)
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _difference(want, got, path="manifest"):
+    """The FIRST place a rebuilt document and the original disagree, named by its wire path. A bare
+    "these differ" over a document with hundreds of entries is a refusal nobody can act on."""
+    if isinstance(want, dict) and isinstance(got, dict):
+        for k in want:
+            if k not in got:
+                return f"{path}.{k} is missing"
+        for k in got:
+            if k not in want:
+                return f"{path}.{k} is not a key this format writes here"
+        for k in want:
+            if want[k] != got[k]:
+                return _difference(want[k], got[k], f"{path}.{k}")
+    if isinstance(want, list) and isinstance(got, list):
+        if len(want) != len(got):
+            return f"{path}: {len(got)} items where this builder writes {len(want)}"
+        for i, (a, b) in enumerate(zip(want, got)):
+            if a != b:
+                return _difference(a, b, f"{path}[{i}]")
+    return f"{path}: {_short(got)} where this builder writes {_short(want)}"
+
+
+def validate(doc):
+    """-> the document, proven to be exactly what build() produces from its own contents.
+
+    Raises ValueError/TypeError -- the same two a bad input to build() raises -- and a caller must
+    treat EITHER as "do not sign this". What it proves is narrow and worth stating: the document is
+    a legal manifest that a builder could have written, its derived fields really follow from its
+    contents, and it carries nothing else. It says nothing about whether the hashes name real
+    bytes, nor whether the serial is the right one -- that second question is the ledger's (see
+    tools/ping.py's ledger_high), and it is the reason the authority reads `serial` from the
+    document rather than from whoever asked for a signature."""
+    rebuilt = build(**load(doc))
+    # `signed_at` is the ONE field a rebuild cannot re-derive: manifest_schema declares it Derived
+    # from an attribute the builder is handed (the clock is not this format's to read), so whatever
+    # the document carries is echoed back and compares equal to itself. Checked here against the
+    # format's own u64 field type rather than against a rule invented in this function.
+    if "signed_at" in doc:
+        try:
+            schema.Int(min=0).render(doc["signed_at"])
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"signed_at: {e}") from None
+    if rebuilt != doc:
+        raise ValueError("this builder does not produce this document from its own contents -- "
+                         + _difference(rebuilt, doc))
+    return rebuilt
+
+
 # --- selftest -----------------------------------------------------------------------------------
 
 # A serial for every case where the NUMBER itself is beside the point. The format's only rule about
@@ -978,6 +1185,88 @@ def _selftest():
 
     refused("an option whose kind is outside the format's union", an_option_kind_outside_the_union)
 
+    # --- reading a document back: what the SIGNING AUTHORITY refuses to put a key to ------------
+    # Every case here is a document that PARSES as JSON and could be handed to seal.py, which signs
+    # bytes and reads nothing. validate() is the only thing between such bytes and the release key.
+
+    def sample():
+        """A document with every optional part present, built the only way one can be."""
+        pak = entry("game/dota/pak01_000.vpk", sha("pak"), 5588, name="pak01_000.vpk")
+        npc = entry("game/dota/scripts/npc/npc_units.txt", sha("npc"), 6189)
+        v_mod = Variant("mod", "New lighting", sha("vmod"), 3537)
+        v_org = Variant("original", "Original lighting", sha("vorg"), 6285, name="orig.vpk")
+        bun = Bundle("b000-txt-4f3a91c2e5d8.phxb", "zstd", 7633, sha("packed"),
+                     entries=[npc, v_mod])
+        opt = Choice("lighting", "Lighting", v_org, "game/dota_phoenix/maps/dota.vpk",
+                     [v_mod, v_org])
+        return build("mod", "1.0.0", _TEST_SERIAL, [pak, npc], bundles=[bun], options=[opt],
+                     tree=[Node(label="Phoenix Core", files=[pak, npc])], notes="what changed")
+
+    def wire(doc):
+        """The bytes a producer uploads and this authority is asked to sign."""
+        return json.dumps(doc, indent=2, ensure_ascii=False).encode("utf-8") + b"\n"
+
+    def as_sent(**tweaks):
+        doc = sample()
+        doc.update(tweaks)
+        return validate(parse(wire(doc)))
+
+    ok("a full document round-trips: parse -> validate returns it unchanged",
+       lambda: assert_(as_sent() == sample(), "the rebuilt document differs from the original"))
+
+    def a_written_manifest_validates():
+        import tempfile
+        e = entry("game/dota/a.bin", sha("a"), 10, name="a.bin")
+        path = os.path.join(tempfile.mkdtemp(), "manifest.json")
+        doc = write(path, "mod", "1.0.0", _TEST_SERIAL, [e])
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        assert_(validate(parse(raw)) == doc, "write()'s own output did not validate")
+
+    ok("what write() puts on disk -- signed_at and all -- validates from its bytes",
+       a_written_manifest_validates)
+
+    refused("a top-level key this format does not write", lambda: as_sent(mirrors=["http://x"]))
+    refused("a rewritten bundle size (the sum is DERIVED from the members)",
+            lambda: as_sent(bundles=[dict(sample()["bundles"][0], size=1)]))
+    refused("a bundle member no entry carries",
+            lambda: as_sent(bundles=[dict(sample()["bundles"][0], members=[sha("ghost")])]))
+    refused("a `schema` that disagrees with the document's own shape", lambda: as_sent(schema=2))
+    refused("a non-empty `remove` (the format writes it empty, always)",
+            lambda: as_sent(remove=["game/dota/old.txt"]))
+    refused("a payload_id outside the closed set, on the wire", lambda: as_sent(payload_id="skins"))
+    refused("a serial that is not a whole number, on the wire", lambda: as_sent(serial="2000001"))
+
+    def traversing_dest_on_the_wire():
+        # Rewritten in BOTH places the wire names it, so the refusal is the dest rule rather than
+        # a tree reference that stopped resolving.
+        doc = sample()
+        doc["files"][0]["dest"] = "../evil.dll"
+        doc["tree"][0]["files"][0] = "../evil.dll"
+        validate(parse(wire(doc)))
+
+    def an_entry_carrying_its_own_key():
+        doc = sample()
+        doc["files"][0]["url"] = "http://mirror.example/pak01_000.vpk"
+        validate(parse(wire(doc)))
+
+    refused("a traversing dest, on the wire", traversing_dest_on_the_wire)
+    refused("a tree node pointing at a dest that is not in files[]",
+            lambda: as_sent(tree=[{"label": "x", "files": ["game/dota/ghost.txt"]}]))
+    refused("a signed_at that is not a timestamp", lambda: as_sent(signed_at="yesterday"))
+    ok("a signed_at that IS one", lambda: as_sent(signed_at=1758000000))
+    refused("an entry carrying a key of its own", an_entry_carrying_its_own_key)
+    refused("a manifest with no files[] at all",
+            lambda: validate(parse(b'{"schema":2,"payload_id":"mod","serial":1,"version":"1.0.0"}')))
+
+    refused("a document whose duplicate key means two things to two parsers",
+            lambda: parse(b'{"payload_id":"mod","serial":1,"serial":9}'))
+    refused("a root that is not an object", lambda: parse(b'["mod", 1]'))
+    refused("bytes that are not UTF-8", lambda: parse(b'{"version":"\xff\xfe"}'))
+    refused("JSON with something appended after it",
+            lambda: parse(wire(sample()) + b'{"serial":9}'))
+    refused("bytes that are not JSON at all", lambda: parse(b"winmm.dll"))
+
     for good, name, detail in results:
         print(f"  {'ok  ' if good else 'FAIL'} {name}" + (f"\n         {detail}" if detail else ""))
     bad = sum(not good for good, _, _ in results)
@@ -990,7 +1279,20 @@ def main():
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     if len(sys.argv) == 2 and sys.argv[1] == "selftest":
         sys.exit(1 if _selftest() else 0)
-    sys.exit("usage: python tools/build_manifest.py selftest")
+    # `validate` is a CLI because two callers outside this module want it: the sealing workflow,
+    # which refuses a dispatched document before the key is read, and a producer, which can ask the
+    # same question of its own manifest before dispatching anything.
+    if len(sys.argv) == 3 and sys.argv[1] == "validate":
+        with open(sys.argv[2], "rb") as fh:
+            raw = fh.read()
+        try:
+            doc = validate(parse(raw))
+        except (ValueError, TypeError) as e:
+            sys.exit(f"REFUSED {sys.argv[2]}\n  {e}")
+        print(f"ok {sys.argv[2]} — schema {doc['schema']}, payload {doc['payload_id']}, "
+              f"serial {doc['serial']}, {len(doc['files'])} file(s)")
+        return
+    sys.exit("usage: python tools/build_manifest.py selftest | validate <manifest.json>")
 
 
 if __name__ == "__main__":
