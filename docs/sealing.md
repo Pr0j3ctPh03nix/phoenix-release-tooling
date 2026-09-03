@@ -173,10 +173,10 @@ The flow is the one above, with its own names:
 
 1. build the list, and **upload it to a DRAFT release** — `mirrors.json`, tagged `v<serial>`;
 2. the serial is `max(the ledger's highest sealed **mirrors** serial, the published one) + 1`
-   (`python .tooling/tools/ping.py ledger --payload mirrors --sealed <ledger>`); the tag *is* the
-   serial, so the published side of that max is the highest `v<n>` the repo has ever named,
-   counting drafts;
-3. dispatch, with `trusted_comment` naming the list, e.g. `phoenix mirrors serial 2`;
+   (`python .tooling/tools/ping.py ledger --payload mirrors --sealed <ledger>`); the published side
+   is the `serial` in the latest release's `mirrors.json`, exactly as for a payload — a tag that
+   was never sealed spent nothing, and one that was is in the ledger;
+3. dispatch, with `trusted_comment` naming the list, e.g. `phoenix mirror list v2`;
 4. wait for `sealed/Pr0j3ctPh03nix/phoenix-mirror-registry/<tag>/{mirrors.json.minisig,ping.json}`;
 5. prove it locally — `phoenix_minisign.py verify mirrors.json --pub .tooling/keys/phoenix-active.pub
    --sig mirrors.json.minisig` — and confirm the ping's serial is the one in the document;
