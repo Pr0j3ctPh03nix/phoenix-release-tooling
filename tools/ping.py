@@ -23,7 +23,9 @@ THE MESSAGE IS A WIRE CONTRACT, re-derived byte for byte by the mirror app (phoe
   * `payload` is `[a-z]+`. Deliberately NOT manifest_schema.PAYLOAD_IDS: which payload lines exist
     is a publishing fact (seal.yml's authorization map decides it, per requesting repo), and a new
     line must not need a release of this repo before a mirror can be told about it. The character
-    class is what the format owes the mirror -- it is a path segment in the sync route.
+    class is what the format owes the mirror -- it is a path segment in the sync route. `mirrors`
+    is exactly that case made real: the mirror list seals under its own ledger payload, and is NOT
+    a manifest payload_id (manifest_schema.PAYLOAD_IDS still, deliberately, omits it).
   * `serial` is plain decimal: no sign, no leading zero, no exponent, no separators. There is
     exactly ONE spelling of a number, so "is this the same serial" is the same question whether a
     reader compares the strings or the integers.
@@ -75,12 +77,14 @@ KEY_ID_LEN = 8                # phoenix_minisign's key id, hex-encoded in the do
 
 # --- the ledger: where a sealed payload's serial is recorded ---------------------------------------
 
-# The sealing workflow commits `<LEDGER_DIR>/<owner>/<name>/<tag>/{manifest.json.minisig,ping.json}`
-# to the branch `sealed`. Both names are part of what the producers fetch, so they live here rather
-# than in the workflow that writes them.
+# The sealing workflow commits `<LEDGER_DIR>/<owner>/<name>/<tag>/{<document>.minisig,ping.json}` to
+# the branch `sealed`, where <document> is the file that was sealed -- `manifest.json` for a payload
+# manifest, `mirrors.json` for the mirror list. These names are part of what the producers fetch, so
+# they live here rather than in the workflow that writes them; and because the signature is named
+# after the DOCUMENT, what a ledger entry can be checked for is the SUFFIX, never one filename.
 LEDGER_DIR = "sealed"
 PING_NAME = "ping.json"
-SIG_NAME = "manifest.json.minisig"
+SIG_SUFFIX = ".minisig"
 
 
 class PingError(Exception):
@@ -238,18 +242,25 @@ def ledger_entries(root):
     """-> [(<owner>/<name>/<tag>, document)] for every sealed entry, in path order.
 
     Exactly three levels deep, and nothing else is looked at: the branch may carry a README at its
-    root without becoming unreadable. Within a tag directory, though, a missing or unreadable
-    ping.json is a PingError rather than a skip -- see ledger_high."""
+    root without becoming unreadable. Within a tag directory, an entry is `ping.json` plus at least
+    one `*.minisig` -- the signature is named after the DOCUMENT it covers, which differs by kind
+    (see SIG_SUFFIX), so the rule cannot be one filename without the ledger refusing every entry
+    whose document is not a manifest. Either half missing is a PingError rather than a skip -- see
+    ledger_high."""
     out = []
     for owner in sorted(_subdirs(root)):
         for name in sorted(_subdirs(os.path.join(root, owner))):
             for tag in sorted(_subdirs(os.path.join(root, owner, name))):
                 rel = "/".join((owner, name, tag))
-                path = os.path.join(root, owner, name, tag, PING_NAME)
-                if not os.path.isfile(path):
+                entry = os.path.join(root, owner, name, tag)
+                files = _files(entry)
+                if PING_NAME not in files:
                     raise PingError(f"{rel}: no {PING_NAME} -- a sealed entry carries both it and "
-                                    f"{SIG_NAME}, written in one commit")
-                doc, _ = read_file(path)
+                                    f"the sealed document's *{SIG_SUFFIX}, written in one commit")
+                if not any(f.endswith(SIG_SUFFIX) for f in files):
+                    raise PingError(f"{rel}: no *{SIG_SUFFIX} -- a sealed entry carries both "
+                                    f"{PING_NAME} and the signature it was written beside")
+                doc, _ = read_file(os.path.join(entry, PING_NAME))
                 out.append((rel, doc))
     return out
 
@@ -257,6 +268,13 @@ def ledger_entries(root):
 def _subdirs(path):
     try:
         return [e.name for e in os.scandir(path) if e.is_dir() and e.name != ".git"]
+    except OSError as e:
+        raise PingError(f"{path}: unreadable ({e})") from None
+
+
+def _files(path):
+    try:
+        return [e.name for e in os.scandir(path) if e.is_file()]
     except OSError as e:
         raise PingError(f"{path}: unreadable ({e})") from None
 
@@ -399,14 +417,19 @@ def _selftest():
     refused("a sig that is not base64", lambda: verify(dict(doc, sig="@@@"), [pub_text]))
 
     # --- the ledger ------------------------------------------------------------------------------
+    # The two document names the sealing authority writes -- see SIG_SUFFIX. The ledger must read
+    # both, which is why its rule is the suffix rather than either of these strings.
+    manifest_sig = "manifest.json" + SIG_SUFFIX
+    mirrors_sig = "mirrors.json" + SIG_SUFFIX
+
     with tempfile.TemporaryDirectory() as tmp:
-        def write_entry(repo, tag, payload, serial, body=None):
+        def write_entry(repo, tag, payload, serial, body=None, sig_name=manifest_sig):
             d = os.path.join(tmp, LEDGER_DIR, *repo.split("/"), tag)
             os.makedirs(d, exist_ok=True)
             with open(os.path.join(d, PING_NAME), "w", encoding="utf-8", newline="\n") as fh:
                 fh.write(json.dumps(body if body is not None
                                     else sign(payload, serial, sec_text)))
-            with open(os.path.join(d, SIG_NAME), "w", encoding="utf-8", newline="\n") as fh:
+            with open(os.path.join(d, sig_name), "w", encoding="utf-8", newline="\n") as fh:
                 fh.write(minisig)
             return d
 
@@ -423,6 +446,11 @@ def _selftest():
         write_entry("Pr0j3ctPh03nix/client-dist-staging", "v1.1.0", "mod", 2_000_043)
         write_entry("Pr0j3ctPh03nix/client-dist-staging", "v1.0.1", "mod", 2_000_042)
         write_entry("Pr0j3ctPh03nix/phoenix-launcher", "v1.5.2", "launcher", 3_000_009)
+        # The mirror registry seals a document that is not a manifest, so its entry's signature is
+        # named mirrors.json.minisig. It is a sealed entry like any other and the ledger must read
+        # it -- the ratchet the registry counts from is this number.
+        write_entry("Pr0j3ctPh03nix/phoenix-mirror-registry", "v2", "mirrors", 2,
+                    sig_name=mirrors_sig)
         with open(os.path.join(tmp, LEDGER_DIR, "README.md"), "w", encoding="utf-8") as fh:
             fh.write("the ledger\n")
 
@@ -432,6 +460,8 @@ def _selftest():
            lambda: assert_(ledger_high(tmp, "launcher") == 3_000_009, "launcher"))
         ok("a payload nobody has sealed reads 0",
            lambda: assert_(ledger_high(tmp, "game") == 0, "game"))
+        ok("an entry whose signature is named for another document (mirrors.json.minisig) reads",
+           lambda: assert_(ledger_high(tmp, "mirrors") == 2, "the mirror list's own ledger line"))
         ok("a checkout ROOT and its sealed/ directory read the same",
            lambda: assert_(ledger_high(os.path.join(tmp, LEDGER_DIR), "mod")
                            == ledger_high(tmp, "mod"), "the two roots disagree"))
@@ -442,9 +472,15 @@ def _selftest():
         write_entry("Pr0j3ctPh03nix/client-dist", "v9.9.9", "mod", 1, body={"serial": "1"})
         refused("a malformed entry is REFUSED, never skipped -- it could be hiding a higher serial",
                 lambda: ledger_high(tmp, "mod"))
-        os.remove(os.path.join(tmp, LEDGER_DIR, "Pr0j3ctPh03nix", "client-dist", "v9.9.9",
-                               PING_NAME))
-        refused("a tag directory carrying only half of what a seal writes",
+        half = os.path.join(tmp, LEDGER_DIR, "Pr0j3ctPh03nix", "client-dist", "v9.9.9")
+        os.remove(os.path.join(half, PING_NAME))
+        refused("a tag directory with a signature and no ping -- half of what a seal writes",
+                lambda: ledger_high(tmp, "mod"))
+        # The other half, and the case the suffix rule exists for: a directory carrying a ping and
+        # NO signature at all is as incomplete as the one above, whatever the document was called.
+        write_entry("Pr0j3ctPh03nix/client-dist", "v9.9.9", "mod", 1)
+        os.remove(os.path.join(half, manifest_sig))
+        refused("a tag directory with a ping and no signature -- the other half",
                 lambda: ledger_high(tmp, "mod"))
 
     for good, name, detail in results:

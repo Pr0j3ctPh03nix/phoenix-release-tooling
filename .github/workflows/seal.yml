@@ -1,48 +1,90 @@
 name: seal
 
-# THE SIGNING AUTHORITY. A payload repo asks; this repo signs; the results come back on a public
-# branch. `PHOENIX_SIGNING_KEY` exists in exactly one place — here — and no payload repo holds it,
-# no payload repo holds a token for another repo, and nothing that a producer builds ever runs in
+# THE SIGNING AUTHORITY. A producer asks; this repo signs; the results come back on a public
+# branch. `PHOENIX_SIGNING_KEY` exists in exactly one place — here — and no producer repo holds it,
+# no producer repo holds a token for another repo, and nothing that a producer builds ever runs in
 # the job that reads the key.
 #
-# THE REQUEST (POST /repos/Pr0j3ctPh03nix/phoenix-release-tooling/dispatches):
+# THE REQUEST
+# (POST /repos/Pr0j3ctPh03nix/phoenix-release-tooling/actions/workflows/seal.yml/dispatches):
 #
-#     {"event_type": "seal",
-#      "client_payload": {"repo": "<owner>/<name>", "tag": "<the release tag>",
-#                         "manifest": "<base64(gzip(the exact manifest.json bytes))>",
-#                         "trusted_comment": "phoenix mod v1.2.3"}}
+#     {"ref": "main",
+#      "inputs": {"repo": "<owner>/<name>", "tag": "<the release tag>",
+#                 "manifest": "<base64(gzip(the exact document bytes))>",
+#                 "trusted_comment": "phoenix mod v1.2.3"}}
+#
+# `manifest` is that field's name whatever KIND of document it carries — a payload manifest or the
+# mirror list — for the same reason tools/seal.py's flag is called `--manifest`: what gets signed is
+# a FILE's exact bytes, and the signer reads nothing inside them.
 #
 # THE ANSWER, on branch `sealed`, which anybody may read:
 #
-#     sealed/<owner>/<name>/<tag>/manifest.json.minisig    the signature over those exact bytes
-#     sealed/<owner>/<name>/<tag>/ping.json                the signed mirror ping for that serial
+#     sealed/<owner>/<name>/<tag>/<document>.minisig   the signature over those exact bytes
+#     sealed/<owner>/<name>/<tag>/ping.json            the signed mirror ping for that serial
+#
+# <document> is the file that was sealed — `manifest.json` for a payload manifest, `mirrors.json`
+# for the mirror list — so a signature in the ledger is never separable from what it covers. The
+# ping is minted for every kind, including one no mirror will ever be told about; see the sealing
+# step for why the entries are uniform.
 #
 # What a producer must do around this — and the fact that its fetch loop still succeeds when a
 # re-run is refused here — is docs/sealing.md. Read that before changing anything below.
 #
 # EVERY GATE RUNS BEFORE THE KEY IS READ, and the order is the whole design:
-#   1. decode and authorize   — a repo may only seal the payload_id it is listed for, below;
-#   2. VALIDATE the document  — tools/build_manifest.py rebuilds it and requires the result to
-#      equal what was sent. Without this the job is an oracle that signs arbitrary bytes with the
-#      one key that also seals the launcher, the base game and the mirror list, and a signature
-#      over attacker-chosen bytes is not a smaller problem than a leaked key;
-#   3. THE RATCHET           — the serial comes from the MANIFEST's own bytes, never from the
+#   0. THE REF               — this file signs only on `main`, checked first and before anything
+#      else is read (see that step: a dispatcher chooses the ref, a `repository_dispatch` could
+#      not);
+#   1. decode and authorize   — a repo may only seal the payload line it is listed for, below;
+#   2. VALIDATE the document  — a manifest is rebuilt by tools/build_manifest.py and the result must
+#      equal what was sent; a mirror list is held to its own narrow rules (see `read_mirrors`).
+#      Without this the job is an oracle that signs arbitrary bytes with the one key that also seals
+#      the launcher, the base game and the mirror list, and a signature over attacker-chosen bytes
+#      is not a smaller problem than a leaked key;
+#   3. THE RATCHET           — the serial comes from the DOCUMENT's own bytes, never from the
 #      request, and must exceed everything branch `sealed` records for that payload. This is where
 #      "a serial only ever rises" is enforced for the whole project; it used to be enforced nowhere,
 #      because each producer merely counted from its own published release.
 # Only then is `cryptography` installed and the secret read.
 #
-# `repository_dispatch` only ever runs the workflow file on the DEFAULT BRANCH, so what signs is
-# this file at HEAD — not the commit a producer pinned. That is the right way round: the key holder
-# decides what touches the key, and a producer pinning an old SHA cannot ask for old signing rules.
+# WHY `workflow_dispatch` AND NOT `repository_dispatch`. The two differ in one thing that matters
+# here: the token a producer needs to send the request. `POST /repos/{owner}/{repo}/dispatches`
+# requires "Contents" repository permissions (write) — a token that can also PUSH to this repository,
+# including to the branch this workflow is read from. The workflow-dispatch endpoint requires
+# "Actions" repository permissions (write) instead
+# (https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event), which cannot
+# write a single byte of a repository's contents. The transport credential is now unable to rewrite
+# what signs, rather than merely forbidden to by a ruleset.
+#
+# What that trade costs is the ref: a `repository_dispatch` always ran the DEFAULT branch's copy of
+# this file, while a dispatcher NAMES the ref it wants and GitHub runs that ref's copy. Step 0 is
+# what buys the property back.
 #
 # NEVER interpolate `${{ }}` into a `run:` block. It is textual substitution performed before bash
 # parses the script, and every field below arrives from an outside repository — a tag name is
 # executable code. Everything from the event goes through `env:` and is read back as "$VAR", and
 # the step that reads it checks each field's character set before anything else sees it.
 on:
-  repository_dispatch:
-    types: [seal]
+  workflow_dispatch:
+    # Exactly four, all required, all strings — the same fields, with the same meanings, that used
+    # to arrive as a `client_payload`. The set is closed again in Python below: `required` here says
+    # only that each one is present.
+    inputs:
+      repo:
+        description: "The repository asking, <owner>/<name>. It may seal one payload line and no other."
+        required: true
+        type: string
+      tag:
+        description: "The release tag this seal is filed under, [A-Za-z0-9][A-Za-z0-9._-]{0,63}"
+        required: true
+        type: string
+      manifest:
+        description: "base64(gzip(the exact bytes of the document to seal))"
+        required: true
+        type: string
+      trusted_comment:
+        description: "Signed and therefore quotable, e.g. 'phoenix mod v1.2.3'"
+        required: true
+        type: string
 
 permissions:
   contents: write        # push the signature and the ping to branch `sealed`
@@ -65,10 +107,33 @@ jobs:
       # out into separate env vars here: the checks that follow have to see the request as a whole
       # (an extra property, a missing one, a wrong type) and an empty string cannot say which of
       # those happened.
-      REQUEST: ${{ toJSON(github.event.client_payload) }}
+      REQUEST: ${{ toJSON(github.event.inputs) }}
       LEDGER_BRANCH: sealed
+      # The one ref this file will sign on. `github.ref` arrives in the environment as GITHUB_REF
+      # already, so the comparison needs no interpolation at all.
+      SEAL_REF: refs/heads/main
     steps:
-      # Everything this run writes: the decoded manifest, the signature, the ping, and the ledger
+      # THE REF GATE, first: before the checkout, before the ledger, before a byte of the request is
+      # looked at. A dispatcher names the ref and GitHub runs THAT ref's copy of this file, so
+      # without this line an old branch is an old, weaker set of these rules holding the same key.
+      #
+      # A gate can only speak for the revisions that carry it — a branch pointing at a commit from
+      # before this step has no gate to run — so it is not the whole of that boundary. The rest is
+      # the token: the dispatch PAT holds Actions: write and nothing else, so it cannot create a ref
+      # or move one, and only somebody with push access could leave a stale branch here to aim at.
+      # This makes such a branch a refusal rather than a signature under superseded rules.
+      - name: Refuse to sign on any ref but main
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "$SEAL_REF" || {
+            echo "REFUSED: this workflow signs only on $SEAL_REF, and this run is on $GITHUB_REF."
+            echo "A dispatch names the ref it runs, and an older branch may carry older rules for"
+            echo "the same key. Dispatch with {\"ref\": \"main\"}."
+            exit 1
+          }
+          echo "ref: $GITHUB_REF"
+
+      # Everything this run writes: the decoded document, the signature, the ping, and the ledger
       # clone. Outside the workspace, because none of it is a file this repository authored — and
       # named in a step rather than in `env:` above, where the `runner` context does not exist.
       - name: Where this run's files go
@@ -115,9 +180,11 @@ jobs:
 
       # THE AUTHORIZATION MAP lives here, in the workflow, because it is a fact about who may ask
       # for what — not about the manifest format, which knows only that `payload_id` is one of a
-      # closed set. The dispatch PAT is the only credential in the request and it says nothing but
-      # "some holder of this token": authorization is therefore by SHAPE — the requesting repo may
-      # seal one payload id and no other, so a stolen launcher token cannot mint a mod release.
+      # closed set, and not about the mirror list's format either, which lives in the registry. The
+      # dispatch PAT is the only credential in the request and it says nothing but "some holder of
+      # this token": authorization is therefore by SHAPE — the requesting repo may seal one payload
+      # line and no other, so a stolen launcher token cannot mint a mod release, and a stolen
+      # registry token cannot mint anything a launcher installs.
       #
       # The base game is absent on purpose: it is published by hand, by someone holding the key
       # offline (see docs/release-keys.md in client-dist-staging), and giving that line a CI path
@@ -130,18 +197,29 @@ jobs:
           import base64, gzip, io, json, os, re, sys
           sys.path.insert(0, "tools")
           import build_manifest
+          import ping
 
           ALLOWED = {
-              "Pr0j3ctPh03nix/client-dist-staging": "mod",
-              "Pr0j3ctPh03nix/client-dist":         "mod",
-              "Pr0j3ctPh03nix/phoenix-launcher":    "launcher",
+              "Pr0j3ctPh03nix/client-dist-staging":     "mod",
+              "Pr0j3ctPh03nix/client-dist":             "mod",
+              "Pr0j3ctPh03nix/phoenix-launcher":        "launcher",
+              "Pr0j3ctPh03nix/phoenix-mirror-registry": "mirrors",
           }
+          # The mirror list is its own DOCUMENT KIND, not a fourth manifest: it has no files and no
+          # bundles, its format is the registry's generate_mirror_list.py, and `mirrors` is
+          # deliberately not in manifest_schema.PAYLOAD_IDS. The two kinds are therefore sealed into
+          # differently NAMED signatures, so nothing downstream can offer one where the other is
+          # expected.
+          MIRRORS = "mirrors"
+          DOC_NAME = {MIRRORS: "mirrors.json"}
+          MANIFEST_NAME = "manifest.json"
+
           FIELDS = ("repo", "tag", "manifest", "trusted_comment")
-          # GitHub caps a client_payload at 64 KB of JSON, so nothing larger can have arrived; the
-          # limit is restated as a refusal rather than assumed, and the decompressed ceiling is what
-          # keeps a small gzip from expanding into an enormous one.
-          MAX_ENCODED = 64 * 1024
-          MAX_MANIFEST = 1024 * 1024
+          # GitHub caps a whole workflow_dispatch `inputs` object at 65,535 characters, so nothing
+          # larger can have arrived; the limit is restated as a refusal rather than assumed, and the
+          # decompressed ceiling is what keeps a small gzip from expanding into an enormous one.
+          MAX_ENCODED = 65_535
+          MAX_DOCUMENT = 1024 * 1024
           # A tag is a directory name in the ledger and an env var this job writes, so it is held to
           # a set with no separator, no traversal and no newline in it.
           TAG_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
@@ -149,12 +227,43 @@ jobs:
           def refuse(why):
               sys.exit("REFUSED: " + why)
 
+          def read_mirrors(doc):
+              """-> the mirror list's serial, or a refusal. DELIBERATELY only these checks.
+
+              There is no builder here to rebuild a mirror list with, and writing one would be
+              exactly the drifting second implementation of a format that build_manifest.validate
+              exists to avoid — the format is the registry's own generate_mirror_list.py. It is also
+              not needed: every rule about the LIST — the URLs, the names, the countries, the
+              payload sets, the duplicates — is enforced by that repo's validate.yml on the pull
+              request that adds a mirror, before anything can be merged or published.
+
+              What this authority owes is narrower, and is entirely about what its signature would
+              MEAN: the bytes are one unambiguous document (build_manifest.parse, below); the
+              document says `mirrors`, so no reader can ever take a signed mirror list for a payload
+              manifest; the serial the ledger ratchets and the ping carries is really in these
+              bytes and is a number a ping can spell; and there is a `mirrors` array, because a
+              document without one is not the thing being asked for."""
+              if doc.get("payload_id") != MIRRORS:
+                  refuse(f"a mirror list carries payload_id {MIRRORS!r}, and this document carries "
+                         f"{doc.get('payload_id')!r}")
+              serial = doc.get("serial")
+              if isinstance(serial, bool) or not isinstance(serial, int):
+                  refuse(f"the mirror list's serial is {serial!r}, and a serial is a whole number")
+              try:
+                  ping.check_serial(serial)      # >= 1, and within the u64 every reader parses
+              except ping.PingError as e:
+                  refuse(f"the mirror list's serial: {e}")
+              if not isinstance(doc.get("mirrors"), list):
+                  refuse(f"a mirror list carries a `mirrors` array; this document carries "
+                         f"{type(doc.get('mirrors')).__name__}")
+              return serial
+
           try:
               req = json.loads(os.environ["REQUEST"])
           except ValueError as e:
-              refuse(f"the client_payload is not JSON ({e})")
+              refuse(f"the dispatch inputs are not JSON ({e})")
           if not isinstance(req, dict) or tuple(sorted(req)) != tuple(sorted(FIELDS)):
-              refuse(f"the client_payload carries {tuple(sorted(req))}, expected exactly "
+              refuse(f"the request carries {tuple(sorted(req))}, expected exactly "
                      f"{tuple(sorted(FIELDS))}")
           if not all(isinstance(req[k], str) and req[k] for k in FIELDS):
               refuse("every field of the request is a non-empty string")
@@ -168,39 +277,53 @@ jobs:
               refuse("the trusted comment must be one line of printable ASCII, 200 chars or fewer")
 
           if len(req["manifest"]) > MAX_ENCODED:
-              refuse(f"the encoded manifest is {len(req['manifest'])} chars; GitHub caps the whole "
-                     f"client_payload at {MAX_ENCODED}")
+              refuse(f"the encoded document is {len(req['manifest'])} chars; GitHub caps a whole "
+                     f"workflow_dispatch `inputs` at {MAX_ENCODED}, which the other three fields "
+                     f"share")
           try:
               blob = base64.b64decode(req["manifest"], validate=True)
               with gzip.GzipFile(fileobj=io.BytesIO(blob)) as gz:
-                  raw = gz.read(MAX_MANIFEST + 1)
+                  raw = gz.read(MAX_DOCUMENT + 1)
           except Exception as e:                       # noqa: BLE001 — malformed is malformed
               refuse(f"the manifest field is not base64(gzip(bytes)): {type(e).__name__}: {e}")
-          if len(raw) > MAX_MANIFEST:
-              refuse(f"the manifest decompresses to more than {MAX_MANIFEST} bytes")
+          if len(raw) > MAX_DOCUMENT:
+              refuse(f"the document decompresses to more than {MAX_DOCUMENT} bytes")
 
-          # The one check that makes this a signing AUTHORITY rather than a signing oracle: the
-          # document is rebuilt by the repo's own builder and must equal what was sent. Any
-          # exception at all is a refusal — a document nobody here can read is not one to sign.
+          payload = ALLOWED[repo]
+          # Read once, strictly, for BOTH kinds: no duplicate keys (a document whose meaning depends
+          # on which parser reads it is one nobody should sign), UTF-8, an object at the root.
           try:
-              doc = build_manifest.validate(build_manifest.parse(raw))
+              doc = build_manifest.parse(raw)
           except Exception as e:                       # noqa: BLE001
-              refuse(f"this is not a manifest this repo would build: {type(e).__name__}: {e}")
+              refuse(f"these bytes are not a document this repo will read: {type(e).__name__}: {e}")
 
-          if doc["payload_id"] != ALLOWED[repo]:
-              refuse(f"{repo} may seal payload_id {ALLOWED[repo]!r}, and this manifest is "
-                     f"{doc['payload_id']!r}")
+          if payload == MIRRORS:
+              serial = read_mirrors(doc)
+              what = f"a mirror list, {len(doc['mirrors'])} mirror(s)"
+          else:
+              # The one check that makes this a signing AUTHORITY rather than a signing oracle: the
+              # document is rebuilt by the repo's own builder and must equal what was sent. Any
+              # exception at all is a refusal — a document nobody here can read is not one to sign.
+              try:
+                  doc = build_manifest.validate(doc)
+              except Exception as e:                   # noqa: BLE001
+                  refuse(f"this is not a manifest this repo would build: {type(e).__name__}: {e}")
+              if doc["payload_id"] != payload:
+                  refuse(f"{repo} may seal payload_id {payload!r}, and this manifest is "
+                         f"{doc['payload_id']!r}")
+              serial = doc["serial"]
+              what = f"a valid {payload} manifest, {len(doc['files'])} file(s)"
 
-          with open(os.path.join(os.environ["WORK"], "manifest.json"), "wb") as fh:
+          name = DOC_NAME.get(payload, MANIFEST_NAME)
+          with open(os.path.join(os.environ["WORK"], name), "wb") as fh:
               fh.write(raw)
           # SERIAL COMES FROM THE DOCUMENT, never from the request: it is the number the signature
           # will cover, and the ratchet must ask about that one and no other.
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
               for k, v in (("REQ_REPO", repo), ("REQ_TAG", tag), ("TRUSTED_COMMENT", comment),
-                           ("PAYLOAD_ID", doc["payload_id"]), ("SERIAL", str(doc["serial"]))):
+                           ("PAYLOAD_ID", payload), ("SERIAL", str(serial)), ("DOC", name)):
                   fh.write(f"{k}={v}\n")
-          print(f"{repo} {tag}: a valid {doc['payload_id']} manifest, serial {doc['serial']}, "
-                f"{len(doc['files'])} file(s), {len(raw)} bytes")
+          print(f"{repo} {tag}: {what}, serial {serial}, {len(raw)} bytes -> {name}")
           PY
 
       # THE RATCHET, and the reason this repo is where it belongs: a serial is per-payload and only
@@ -223,7 +346,7 @@ jobs:
           high = ping.ledger_high(os.environ["LEDGER"], payload)
           if serial <= high:
               sys.exit(f"REFUSED: {payload} has already been sealed at serial {high}, and this "
-                       f"manifest carries {serial}. A serial only ever rises: a client holding "
+                       f"document carries {serial}. A serial only ever rises: a client holding "
                        f"{high} would refuse {serial}, silently, and report itself up to date.\n"
                        f"  If this is a re-run of a payload job that already got its seal, the "
                        f"files are in the ledger already — fetch them.\n"
@@ -240,12 +363,20 @@ jobs:
       - name: Install the signing dependency
         run: python -m pip install --disable-pip-version-check --no-index --find-links wheels cryptography
 
-      # Sign the manifest's exact bytes and prove the signature against the public half clients
+      # Sign the document's exact bytes and prove the signature against the public half clients
       # pin (tools/seal.py — the ORDER of those two is the whole point), then sign the mirror ping
       # for the same serial and prove that too. Both are the same key and both fail the same way if
       # it is ever rotated without republishing keys/: perfectly valid signatures nobody accepts,
       # whose only symptom is an update channel that has quietly stopped existing.
-      - name: Seal the manifest and sign its ping
+      #
+      # A PING IS MINTED FOR EVERY KIND, including `mirrors`, which no mirror will ever be told
+      # about — a mirror's registry entry lists the payload trees it serves (mod/launcher/game) and
+      # never the list itself, so notify_mirrors.py finds no carrier and the registry does not even
+      # call it. It is minted anyway because it makes every ledger entry the same two files, and
+      # `ping.json` is where tools/ping.py's ledger reads a serial from: a kind that skipped it
+      # would be a kind the ratchet cannot see. `[a-z]+` is the whole of what a ping's payload has
+      # to satisfy, and `mirrors` satisfies it.
+      - name: Seal the document and sign its ping
         env:
           PHOENIX_SIGNING_KEY: ${{ secrets.PHOENIX_SIGNING_KEY }}
         run: |
@@ -256,7 +387,7 @@ jobs:
             exit 1
           }
           python tools/seal.py seal \
-            --manifest "$WORK/manifest.json" \
+            --manifest "$WORK/$DOC" \
             --pub      keys/phoenix-active.pub \
             --trusted-comment "$TRUSTED_COMMENT"
           python tools/ping.py sign \
@@ -276,7 +407,7 @@ jobs:
           set -euo pipefail
           entry="$LEDGER/sealed/$REQ_REPO/$REQ_TAG"
           mkdir -p "$entry"
-          cp "$WORK/manifest.json.minisig" "$WORK/ping.json" "$entry/"
+          cp "$WORK/$DOC.minisig" "$WORK/ping.json" "$entry/"
           cd "$LEDGER"
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -308,5 +439,5 @@ jobs:
             echo "Requested by \`$REQ_REPO\` for tag \`$REQ_TAG\`."
             echo
             echo "    git fetch https://github.com/$GITHUB_REPOSITORY $LEDGER_BRANCH"
-            echo "    git show FETCH_HEAD:sealed/$REQ_REPO/$REQ_TAG/manifest.json.minisig"
+            echo "    git show FETCH_HEAD:sealed/$REQ_REPO/$REQ_TAG/$DOC.minisig"
           } >> "$GITHUB_STEP_SUMMARY"

@@ -1237,6 +1237,18 @@ def _selftest():
     refused("a payload_id outside the closed set, on the wire", lambda: as_sent(payload_id="skins"))
     refused("a serial that is not a whole number, on the wire", lambda: as_sent(serial="2000001"))
 
+    # The mirror list is sealed by the same authority (.github/workflows/seal.yml) and is NOT a
+    # manifest: it is checked by its own narrow rules and its signature is named after its own
+    # document. Both directions of that line are asserted here, where the closed set lives -- a
+    # manifest cannot claim to be a mirror list, and a mirror list cannot validate as a manifest.
+    ok("'mirrors' is not one of this format's payload ids",
+       lambda: assert_("mirrors" not in schema.PAYLOAD_IDS, f"PAYLOAD_IDS: {schema.PAYLOAD_IDS}"))
+    refused("a manifest claiming payload_id 'mirrors'", lambda: as_sent(payload_id="mirrors"))
+    refused("a mirror list offered to the manifest builder",
+            lambda: validate(parse(json.dumps(
+                {"format": 1, "payload_id": "mirrors", "serial": 2,
+                 "mirrors": []}).encode("utf-8"))))
+
     def traversing_dest_on_the_wire():
         # Rewritten in BOTH places the wire names it, so the refusal is the dest rule rather than
         # a tree reference that stopped resolving.

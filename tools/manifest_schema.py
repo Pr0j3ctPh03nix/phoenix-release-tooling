@@ -33,11 +33,14 @@ keyword-only parameter of the same name, which is a naming convention (like `pay
 
 SCHEMA = 3
 
-# Deliberately WITHOUT "mirrors": nothing in this codebase emits one or reads one. Adding it back
-# is an ADDITIVE change to this tuple alone, made the day something actually produces it -- not
-# reserved speculatively, which is exactly how the previous four-entry set went stale (see git
-# history: validate_manifest.py carried a second, hand-duplicated copy of this same set, and the
-# two were free to drift apart with nothing to notice).
+# Deliberately WITHOUT "mirrors", and now for a stronger reason than when the mirror list did not
+# exist. It does: the registry publishes one and .github/workflows/seal.yml seals it, under its own
+# rules, into a signature named after its own document. "mirrors" stays out of this tuple because
+# that is what makes the two kinds unmistakable in BOTH directions -- a mirror list can never
+# validate as a manifest here, and a manifest can never claim to be a mirror list. Adding it would
+# not extend the format, it would erase that line. (build_manifest.py's selftest asserts the
+# absence; the same set once lived hand-duplicated in validate_manifest.py and the two were free to
+# drift apart with nothing to notice -- see git history.)
 PAYLOAD_IDS = ("mod", "launcher", "game")
 
 CODECS = ("zstd",)
