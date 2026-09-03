@@ -1,0 +1,312 @@
+name: seal
+
+# THE SIGNING AUTHORITY. A payload repo asks; this repo signs; the results come back on a public
+# branch. `PHOENIX_SIGNING_KEY` exists in exactly one place — here — and no payload repo holds it,
+# no payload repo holds a token for another repo, and nothing that a producer builds ever runs in
+# the job that reads the key.
+#
+# THE REQUEST (POST /repos/Pr0j3ctPh03nix/phoenix-release-tooling/dispatches):
+#
+#     {"event_type": "seal",
+#      "client_payload": {"repo": "<owner>/<name>", "tag": "<the release tag>",
+#                         "manifest": "<base64(gzip(the exact manifest.json bytes))>",
+#                         "trusted_comment": "phoenix mod v1.2.3"}}
+#
+# THE ANSWER, on branch `sealed`, which anybody may read:
+#
+#     sealed/<owner>/<name>/<tag>/manifest.json.minisig    the signature over those exact bytes
+#     sealed/<owner>/<name>/<tag>/ping.json                the signed mirror ping for that serial
+#
+# What a producer must do around this — and the fact that its fetch loop still succeeds when a
+# re-run is refused here — is docs/sealing.md. Read that before changing anything below.
+#
+# EVERY GATE RUNS BEFORE THE KEY IS READ, and the order is the whole design:
+#   1. decode and authorize   — a repo may only seal the payload_id it is listed for, below;
+#   2. VALIDATE the document  — tools/build_manifest.py rebuilds it and requires the result to
+#      equal what was sent. Without this the job is an oracle that signs arbitrary bytes with the
+#      one key that also seals the launcher, the base game and the mirror list, and a signature
+#      over attacker-chosen bytes is not a smaller problem than a leaked key;
+#   3. THE RATCHET           — the serial comes from the MANIFEST's own bytes, never from the
+#      request, and must exceed everything branch `sealed` records for that payload. This is where
+#      "a serial only ever rises" is enforced for the whole project; it used to be enforced nowhere,
+#      because each producer merely counted from its own published release.
+# Only then is `cryptography` installed and the secret read.
+#
+# `repository_dispatch` only ever runs the workflow file on the DEFAULT BRANCH, so what signs is
+# this file at HEAD — not the commit a producer pinned. That is the right way round: the key holder
+# decides what touches the key, and a producer pinning an old SHA cannot ask for old signing rules.
+#
+# NEVER interpolate `${{ }}` into a `run:` block. It is textual substitution performed before bash
+# parses the script, and every field below arrives from an outside repository — a tag name is
+# executable code. Everything from the event goes through `env:` and is read back as "$VAR", and
+# the step that reads it checks each field's character set before anything else sees it.
+on:
+  repository_dispatch:
+    types: [seal]
+
+permissions:
+  contents: write        # push the signature and the ping to branch `sealed`
+
+# ONE SEAL AT A TIME, and queued rather than cancelled. The ratchet reads the ledger and then adds
+# to it, so two overlapping runs would both read the same high-water mark; and a cancelled run is
+# one that may already have signed, which is not a run any later one supersedes — it is a producer
+# waiting for a file that will never appear. Two payloads sealing at once therefore serialise here,
+# which costs a minute and removes the whole class.
+concurrency:
+  group: seal
+  cancel-in-progress: false
+
+jobs:
+  seal:
+    runs-on: ubuntu-latest
+    env:
+      # The whole request as JSON. Read as DATA by the step below, which is what makes a tag name
+      # or a comment field text rather than script. Individual fields are deliberately NOT pulled
+      # out into separate env vars here: the checks that follow have to see the request as a whole
+      # (an extra property, a missing one, a wrong type) and an empty string cannot say which of
+      # those happened.
+      REQUEST: ${{ toJSON(github.event.client_payload) }}
+      LEDGER_BRANCH: sealed
+    steps:
+      # Everything this run writes: the decoded manifest, the signature, the ping, and the ledger
+      # clone. Outside the workspace, because none of it is a file this repository authored — and
+      # named in a step rather than in `env:` above, where the `runner` context does not exist.
+      - name: Where this run's files go
+        run: |
+          echo "WORK=$RUNNER_TEMP/seal" >> "$GITHUB_ENV"
+          echo "LEDGER=$RUNNER_TEMP/ledger" >> "$GITHUB_ENV"
+
+      # Third-party actions are pinned to COMMIT SHAs, not tags: a tag is mutable, and every action
+      # in this job runs beside PHOENIX_SIGNING_KEY. The trailing comment is the human-readable
+      # version; update both together.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      # The ledger, as it stands before this request. Cloned rather than checked out into the
+      # workspace: it is a branch with an unrelated history (an orphan), and it must not be
+      # mistakable for the tree this repo's tools are read from.
+      #
+      # A MISSING BRANCH IS A LEGITIMATE STATE — exactly once, before the first payload is ever
+      # sealed — and it is told apart from "the ledger could not be read" by ls-remote's exit code,
+      # not by guessing from a failed clone. The difference matters: an unreadable ledger read as
+      # empty would let a replayed serial through the ratchet.
+      - name: Fetch the ledger
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          url="https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY"
+          set +e
+          git ls-remote --exit-code --heads "$url" "$LEDGER_BRANCH" >/dev/null 2>&1
+          rc=$?
+          set -e
+          case "$rc" in
+            0) # Not shallow: this history is one small commit per release, and a shallow clone is
+               # a clone the retry below cannot rebase cleanly.
+               git clone --quiet --branch "$LEDGER_BRANCH" --single-branch "$url" "$LEDGER"
+               echo "ledger: $LEDGER_BRANCH at $(git -C "$LEDGER" rev-parse --short HEAD)" ;;
+            2) echo "ledger: no '$LEDGER_BRANCH' branch yet — nothing has ever been sealed here"
+               mkdir -p "$LEDGER"
+               git -C "$LEDGER" init --quiet --initial-branch "$LEDGER_BRANCH"
+               git -C "$LEDGER" remote add origin "$url" ;;
+            *) echo "cannot tell whether '$LEDGER_BRANCH' exists (git ls-remote exited $rc) —"
+               echo "refusing to treat an unreadable ledger as an empty one."
+               exit 1 ;;
+          esac
+
+      # THE AUTHORIZATION MAP lives here, in the workflow, because it is a fact about who may ask
+      # for what — not about the manifest format, which knows only that `payload_id` is one of a
+      # closed set. The dispatch PAT is the only credential in the request and it says nothing but
+      # "some holder of this token": authorization is therefore by SHAPE — the requesting repo may
+      # seal one payload id and no other, so a stolen launcher token cannot mint a mod release.
+      #
+      # The base game is absent on purpose: it is published by hand, by someone holding the key
+      # offline (see docs/release-keys.md in client-dist-staging), and giving that line a CI path
+      # would mean a second way to publish it.
+      - name: Read the request
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK"
+          python - <<'PY'
+          import base64, gzip, io, json, os, re, sys
+          sys.path.insert(0, "tools")
+          import build_manifest
+
+          ALLOWED = {
+              "Pr0j3ctPh03nix/client-dist-staging": "mod",
+              "Pr0j3ctPh03nix/client-dist":         "mod",
+              "Pr0j3ctPh03nix/phoenix-launcher":    "launcher",
+          }
+          FIELDS = ("repo", "tag", "manifest", "trusted_comment")
+          # GitHub caps a client_payload at 64 KB of JSON, so nothing larger can have arrived; the
+          # limit is restated as a refusal rather than assumed, and the decompressed ceiling is what
+          # keeps a small gzip from expanding into an enormous one.
+          MAX_ENCODED = 64 * 1024
+          MAX_MANIFEST = 1024 * 1024
+          # A tag is a directory name in the ledger and an env var this job writes, so it is held to
+          # a set with no separator, no traversal and no newline in it.
+          TAG_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+
+          def refuse(why):
+              sys.exit("REFUSED: " + why)
+
+          try:
+              req = json.loads(os.environ["REQUEST"])
+          except ValueError as e:
+              refuse(f"the client_payload is not JSON ({e})")
+          if not isinstance(req, dict) or tuple(sorted(req)) != tuple(sorted(FIELDS)):
+              refuse(f"the client_payload carries {tuple(sorted(req))}, expected exactly "
+                     f"{tuple(sorted(FIELDS))}")
+          if not all(isinstance(req[k], str) and req[k] for k in FIELDS):
+              refuse("every field of the request is a non-empty string")
+
+          repo, tag, comment = req["repo"], req["tag"], req["trusted_comment"]
+          if repo not in ALLOWED:
+              refuse(f"{repo!r} may not ask this repository to sign anything")
+          if not TAG_RE.match(tag):
+              refuse(f"tag {tag!r} is not [A-Za-z0-9][A-Za-z0-9._-]{{0,63}}")
+          if len(comment) > 200 or not all(" " <= c <= "~" for c in comment):
+              refuse("the trusted comment must be one line of printable ASCII, 200 chars or fewer")
+
+          if len(req["manifest"]) > MAX_ENCODED:
+              refuse(f"the encoded manifest is {len(req['manifest'])} chars; GitHub caps the whole "
+                     f"client_payload at {MAX_ENCODED}")
+          try:
+              blob = base64.b64decode(req["manifest"], validate=True)
+              with gzip.GzipFile(fileobj=io.BytesIO(blob)) as gz:
+                  raw = gz.read(MAX_MANIFEST + 1)
+          except Exception as e:                       # noqa: BLE001 — malformed is malformed
+              refuse(f"the manifest field is not base64(gzip(bytes)): {type(e).__name__}: {e}")
+          if len(raw) > MAX_MANIFEST:
+              refuse(f"the manifest decompresses to more than {MAX_MANIFEST} bytes")
+
+          # The one check that makes this a signing AUTHORITY rather than a signing oracle: the
+          # document is rebuilt by the repo's own builder and must equal what was sent. Any
+          # exception at all is a refusal — a document nobody here can read is not one to sign.
+          try:
+              doc = build_manifest.validate(build_manifest.parse(raw))
+          except Exception as e:                       # noqa: BLE001
+              refuse(f"this is not a manifest this repo would build: {type(e).__name__}: {e}")
+
+          if doc["payload_id"] != ALLOWED[repo]:
+              refuse(f"{repo} may seal payload_id {ALLOWED[repo]!r}, and this manifest is "
+                     f"{doc['payload_id']!r}")
+
+          with open(os.path.join(os.environ["WORK"], "manifest.json"), "wb") as fh:
+              fh.write(raw)
+          # SERIAL COMES FROM THE DOCUMENT, never from the request: it is the number the signature
+          # will cover, and the ratchet must ask about that one and no other.
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
+              for k, v in (("REQ_REPO", repo), ("REQ_TAG", tag), ("TRUSTED_COMMENT", comment),
+                           ("PAYLOAD_ID", doc["payload_id"]), ("SERIAL", str(doc["serial"]))):
+                  fh.write(f"{k}={v}\n")
+          print(f"{repo} {tag}: a valid {doc['payload_id']} manifest, serial {doc['serial']}, "
+                f"{len(doc['files'])} file(s), {len(raw)} bytes")
+          PY
+
+      # THE RATCHET, and the reason this repo is where it belongs: a serial is per-payload and only
+      # ever rises, and until sealing moved here nothing enforced that across producers — each one
+      # merely counted up from its own latest published release, which cannot see a serial that was
+      # sealed and then never published.
+      #
+      # Refusing here leaves the ledger untouched and the run red. The most common cause is benign
+      # and documented: a payload job that died after tooling had already sealed its tag, re-run
+      # without a new serial. Its fetch loop still finds the files the earlier run wrote.
+      - name: Check the serial against the ledger
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, sys
+          sys.path.insert(0, "tools")
+          import ping
+
+          payload, serial = os.environ["PAYLOAD_ID"], int(os.environ["SERIAL"])
+          high = ping.ledger_high(os.environ["LEDGER"], payload)
+          if serial <= high:
+              sys.exit(f"REFUSED: {payload} has already been sealed at serial {high}, and this "
+                       f"manifest carries {serial}. A serial only ever rises: a client holding "
+                       f"{high} would refuse {serial}, silently, and report itself up to date.\n"
+                       f"  If this is a re-run of a payload job that already got its seal, the "
+                       f"files are in the ledger already — fetch them.\n"
+                       f"  If it is a fresh attempt, the producer must pick "
+                       f"max(ledger, published) + 1. See docs/sealing.md.")
+          print(f"{payload}: highest sealed serial {high} -> this request seals {serial}")
+          PY
+
+      # FROM THE PINNED CHECKOUT, NOT FROM AN INDEX — the same rule, and the same wheels, every
+      # producer's workflow uses (see wheels/README.md). This job holds PHOENIX_SIGNING_KEY and
+      # `cryptography` is the code the key is handed to, so it arrives from this repository's own
+      # tree rather than from whatever an index answers with at signing time. Installed only after
+      # every gate above has passed: a refused request never installs anything.
+      - name: Install the signing dependency
+        run: python -m pip install --disable-pip-version-check --no-index --find-links wheels cryptography
+
+      # Sign the manifest's exact bytes and prove the signature against the public half clients
+      # pin (tools/seal.py — the ORDER of those two is the whole point), then sign the mirror ping
+      # for the same serial and prove that too. Both are the same key and both fail the same way if
+      # it is ever rotated without republishing keys/: perfectly valid signatures nobody accepts,
+      # whose only symptom is an update channel that has quietly stopped existing.
+      - name: Seal the manifest and sign its ping
+        env:
+          PHOENIX_SIGNING_KEY: ${{ secrets.PHOENIX_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$PHOENIX_SIGNING_KEY" || {
+            echo "secrets.PHOENIX_SIGNING_KEY is not set in the one repository that holds it."
+            echo "Every producer is now waiting on a signature nobody can make."
+            exit 1
+          }
+          python tools/seal.py seal \
+            --manifest "$WORK/manifest.json" \
+            --pub      keys/phoenix-active.pub \
+            --trusted-comment "$TRUSTED_COMMENT"
+          python tools/ping.py sign \
+            --payload "$PAYLOAD_ID" --serial "$SERIAL" --out "$WORK/ping.json"
+          python tools/ping.py verify "$WORK/ping.json" --pub keys/phoenix-active.pub
+          ls -l "$WORK"
+
+      # THE ANSWER, and the ledger entry, in ONE commit: the two files are written together because
+      # tools/ping.py refuses a tag directory carrying only one of them — a half-written entry would
+      # make every later ratchet read fail rather than merely be incomplete.
+      #
+      # The push is retried on a non-fast-forward. `concurrency` above should make that impossible,
+      # but the cost of being wrong is a producer waiting ten minutes for a file that was signed and
+      # then dropped, and the cost of the retry is four lines.
+      - name: Publish to the ledger
+        run: |
+          set -euo pipefail
+          entry="$LEDGER/sealed/$REQ_REPO/$REQ_TAG"
+          mkdir -p "$entry"
+          cp "$WORK/manifest.json.minisig" "$WORK/ping.json" "$entry/"
+          cd "$LEDGER"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "sealed/$REQ_REPO/$REQ_TAG"
+          if git diff --cached --quiet; then
+            echo "the ledger already carries exactly these bytes — nothing to push"
+            exit 0
+          fi
+          git commit --quiet -m "seal: $REQ_REPO $REQ_TAG — $PAYLOAD_ID serial $SERIAL"
+          for attempt in 1 2 3; do
+            if git push --quiet origin "HEAD:$LEDGER_BRANCH"; then
+              echo "sealed/$REQ_REPO/$REQ_TAG is published on $LEDGER_BRANCH"
+              exit 0
+            fi
+            echo "push $attempt was rejected; rebasing onto $LEDGER_BRANCH and trying again"
+            git fetch --quiet origin "$LEDGER_BRANCH"
+            git rebase FETCH_HEAD
+            sleep 5
+          done
+          echo "could not publish the seal to $LEDGER_BRANCH. It WAS signed: re-run this job, or"
+          echo "the producer must dispatch again with a higher serial."
+          exit 1
+
+      - name: Summary
+        run: |
+          {
+            echo "### Sealed \`$PAYLOAD_ID\` serial \`$SERIAL\`"
+            echo
+            echo "Requested by \`$REQ_REPO\` for tag \`$REQ_TAG\`."
+            echo
+            echo "    git fetch https://github.com/$GITHUB_REPOSITORY $LEDGER_BRANCH"
+            echo "    git show FETCH_HEAD:sealed/$REQ_REPO/$REQ_TAG/manifest.json.minisig"
+          } >> "$GITHUB_STEP_SUMMARY"
