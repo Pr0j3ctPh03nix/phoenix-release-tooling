@@ -250,10 +250,10 @@ with a serial above the ledger is a fresh, legal attempt.
 
 * **The base game** (`game-dist`) is published by hand, by someone holding `active.key` offline —
   see `client-dist-staging/docs/release-keys.md`. It never dispatched anything and still does not.
-  Whoever publishes it is the authority for that release and mints its ping themselves:
+  Whoever publishes it is the authority for that release and mints its ping themselves —
+  `build_game_bundles.py` (in `client-dist-staging`) does it after the upload, with the same key it
+  sealed with, and delivers it through `notify_mirrors.py`. By hand, the same two steps are
   `python tools/ping.py sign --sec active.key --payload game --serial <the sealed serial> --out
-  ping.json`, then `notify_mirrors.py notify --ping-file ping.json --strict`. Nothing builds that
-  ping for them today — `build_game_bundles.py` seals but does not ping, and it lives in another
-  repository.
+  ping.json`, then `notify_mirrors.py notify --ping-file ping.json --strict`.
 * **A recovery release** (`phoenix-recovery.pub`) is by hand by construction: RECOVERY never enters
   CI, here or anywhere.
