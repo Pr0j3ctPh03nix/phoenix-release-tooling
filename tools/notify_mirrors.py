@@ -1,30 +1,54 @@
 #!/usr/bin/env python3
 """Ping every published mirror so it syncs the release that was just published.
 
-    python tools/notify_mirrors.py notify                       # the published registry list
-    python tools/notify_mirrors.py notify --list mirrors.json --strict
+    python tools/notify_mirrors.py notify --ping-file ping.json           # the published registry
+    python tools/notify_mirrors.py notify --ping-file ping.json --list mirrors.json --strict
     python tools/notify_mirrors.py selftest
 
 ONE copy, because there are three producers and a mirror must not hear about a release three
 different ways: the mod in dist's CI, the launcher in its own, the base game by hand. Each already
-checks this repo out at a pinned commit SHA to seal with, so the ping arrives by the same pin as the
-seal — and the one thing every producer does after publishing is written once, here.
+checks this repo out at a pinned commit SHA, so the delivery arrives by the same pin as everything
+else it reads from here — and the one thing every producer does after publishing is written once.
 
-Mirrors pull from GitHub on a timer; this only says "now". `<base_url>/sync` is unauthenticated and
-rate-limited on the mirror's side, so nothing here carries a credential and a mirror is free to
-ignore it. The list of mirrors is the registry's latest release asset `mirrors.json`
+WHO MINTS THE PING is not this script and not the producer: it is the signing authority, in the same
+job that sealed the manifest (.github/workflows/seal.yml), and a producer fetches it from branch
+`sealed` beside the signature — see docs/sealing.md. The by-hand base game is the exception that
+proves it: whoever holds the key mints its ping with `tools/ping.py sign --sec`, because they are
+the authority that day.
+
+WHAT IS DELIVERED is the SIGNED ping document tools/ping.py minted at the moment the payload was
+sealed — `--ping-file`, POSTed verbatim as the request body:
+
+    POST <base_url>/sync/<payload>          Content-Type: application/json
+    body: the exact bytes of ping.json      (payload, serial, key_id, sig)
+
+The payload id comes out of that file, never from an argument, and only mirrors whose registry
+entry lists that payload are contacted at all: a mirror that carries the launcher and not the base
+game is not a mirror that failed to sync the base game, it is one the base game was never for.
+
+Mirrors pull from GitHub on a timer; this only says "now, and here is the serial". The endpoint is
+unauthenticated and rate-limited on the mirror's side — nothing here carries a credential, and a
+mirror is free to ignore the ping — but it is no longer CONTENTLESS: the serial in the body is a
+number a mirror acts on, so it is signed with the release key and the mirror checks it before
+believing it (see tools/ping.py for the message and why it is not a .minisig). That is also what
+makes the courier irrelevant: anyone may deliver this document, so a producer that dies before
+pinging costs nothing a later run cannot redo.
+
+The list of mirrors is the registry's latest release asset `mirrors.json`
 (Pr0j3ctPh03nix/phoenix-mirror-registry — public, hence no token), whose format is that repo's
 generate_mirror_list.py.
 
 THE EXIT STATUS IS THE CONTRACT, and it is the reason this is a script rather than a curl loop in
 each of the three workflows:
 
-  0          the list was obtained and every mirror was attempted — however many refused, failed or
-             were unreachable. The release is already published by the time this runs, so a mirror
-             being down must never turn a shipped release into a red run: nobody can fix it from
-             here, and a red run beside a green release is a light everyone learns to ignore.
-  non-zero   the list itself could not be fetched or parsed, or an argument was bad. That is a fact
-             about this repo's tooling — no mirror was pinged at all — and it is worth waking up to.
+  0          the list was obtained and every mirror that carries this payload was attempted —
+             however many refused, failed or were unreachable. The release is already published by
+             the time this runs, so a mirror being down must never turn a shipped release into a red
+             run: nobody can fix it from here, and a red run beside a green release is a light
+             everyone learns to ignore.
+  non-zero   the list itself could not be fetched or parsed, the ping file could not be read, or an
+             argument was bad. That is a fact about this repo's tooling — no mirror was pinged at
+             all — and it is worth waking up to.
   --strict   also non-zero if any mirror failed. For the by-hand game release, where a person is
              watching and can retry a single host.
 
@@ -37,7 +61,9 @@ https:// is refused WITHOUT a request, and a redirect is never followed. So no l
 document can make a release runner open anything but an HTTP request to the host it named.
 
 Stdlib only, like everything here that is not the signer: this runs in release CI right after the
-sealed release is published, and a `pip install` is an input that pipeline does not need.
+sealed release is published, and a `pip install` is an input that pipeline does not need. The one
+import from this repo is tools/ping.py, which is stdlib-only until it signs or verifies — this reads
+a ping, it never makes one.
 """
 import argparse
 import json
@@ -50,13 +76,18 @@ import urllib.request
 from collections import namedtuple
 from typing import NoReturn
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ping  # noqa: E402 — the ping document's shape, owned by the tool that signs it
+
 REGISTRY = "Pr0j3ctPh03nix/phoenix-mirror-registry"
 LATEST = "https://api.github.com/repos/{}/releases/latest"
 LIST_ASSET = "mirrors.json"
 
-# The mirror's sync endpoint, appended to a registered `base_url`. Part of the mirror app's
-# contract, not a local naming choice.
+# The mirror's sync endpoint: `<base_url>/sync/<payload>`. Part of the mirror app's contract, not a
+# local naming choice — the payload is a path segment there, which is why tools/ping.py closes that
+# id to [a-z]+.
 SYNC_PATH = "/sync"
+CONTENT_TYPE = "application/json"
 
 # The only two schemes a list entry may name. See the header: this is the one rule that keeps a
 # published document from choosing what a key-holding runner connects to.
@@ -66,6 +97,7 @@ UA = "phoenix-notify-mirrors"
 TIMEOUT = 10.0
 BACKOFF = 1.0                 # seconds, times the attempt number: 1s, 2s, ...
 
+Mirror = namedtuple("Mirror", "name base_url payloads")
 Result = namedtuple("Result", "name url ok detail")
 
 
@@ -126,11 +158,16 @@ def load_list(path):
 
 
 def mirror_entries(doc):
-    """-> [(name, base_url)] in the document's own order, which the registry has already sorted.
+    """-> [Mirror] in the document's own order, which the registry has already sorted.
 
     A document that is not shaped like a mirror list is a NotifyError — "I could not read the list"
     — while an entry that merely names something unpingable is a reported failure below. The two
     must not collapse: the first means no mirror was reached, the second means one was skipped.
+
+    `payloads` is required for the same reason `base_url` is: it is what the registry publishes for
+    every entry, and an entry without one names no answer to "is this release for you". Guessing
+    either way is worse than saying so — assume "all" and a mod ping goes to base-game-only mirrors
+    forever; assume "none" and a mirror is silently never told about anything.
     """
     if not isinstance(doc, dict) or not isinstance(doc.get("mirrors"), list):
         raise NotifyError("not a mirror list: no `mirrors` array")
@@ -138,23 +175,29 @@ def mirror_entries(doc):
     for i, e in enumerate(doc["mirrors"]):
         if not isinstance(e, dict) or not isinstance(e.get("base_url"), str):
             raise NotifyError("mirrors[{}] carries no string base_url".format(i))
+        payloads = e.get("payloads")
+        if not isinstance(payloads, list) or not all(isinstance(p, str) for p in payloads):
+            raise NotifyError("mirrors[{}] carries no `payloads` list of strings".format(i))
         name = e.get("name")
-        out.append((name if isinstance(name, str) and name else e["base_url"], e["base_url"]))
+        out.append(Mirror(name if isinstance(name, str) and name else e["base_url"],
+                          e["base_url"], tuple(payloads)))
     return out
 
 
 # --- the ping -------------------------------------------------------------------------------------
 
-def sync_url(base_url):
-    """`<base_url>/sync`, or None if base_url is not an http(s) URL.
+def sync_url(base_url, payload):
+    """`<base_url>/sync/<payload>`, or None if base_url is not an http(s) URL.
 
     The trailing slash is stripped for the same reason the registry refuses one: the launcher's
-    canonical form has none, and `//sync` is a different path on plenty of servers."""
+    canonical form has none, and `//sync` is a different path on plenty of servers. `payload` is
+    interpolated raw because it has already been through tools/ping.py's `[a-z]+` — there is no
+    escaping to get wrong, which is exactly why that rule is that narrow."""
     url = base_url.strip()
     parts = urllib.parse.urlsplit(url)
     if parts.scheme not in SCHEMES or not parts.netloc:
         return None
-    return url.rstrip("/") + SYNC_PATH
+    return url.rstrip("/") + SYNC_PATH + "/" + payload
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -168,13 +211,16 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def ping(url, retries, timeout, opener):
-    """POST it. -> (ok, detail). Retries connection failures and 5xx, nothing else.
+def post(url, body, retries, timeout, opener):
+    """POST the ping document. -> (ok, detail). Retries connection failures and 5xx, nothing else.
 
     ANY 2xx is success and urllib enforces that by itself: urlopen returns only for 200..299 and
-    raises HTTPError for everything else. A 4xx is the mirror's considered answer — retrying it
-    would just be the same answer, three times."""
-    req = urllib.request.Request(url, data=b"", method="POST", headers={"User-Agent": UA})
+    raises HTTPError for everything else. The mirror app answers 202 for "syncing" and 200 for
+    "already have it", and both are this script's job done — which of the two came back is reported
+    and never acted on. A 4xx is the mirror's considered answer — retrying it would just be the
+    same answer, three times."""
+    req = urllib.request.Request(url, data=body, method="POST",
+                                 headers={"User-Agent": UA, "Content-Type": CONTENT_TYPE})
     detail = ""
     for attempt in range(1, retries + 1):
         try:
@@ -190,21 +236,26 @@ def ping(url, retries, timeout, opener):
     return False, detail
 
 
-def notify(entries, retries, timeout):
-    """Every mirror, in order, whatever the last one did. -> [Result]."""
+def notify(mirrors, payload, body, retries, timeout):
+    """Every mirror that carries `payload`, in order, whatever the last one did. -> [Result].
+
+    A mirror that does not carry it is not in the results at all — it is not a mirror that failed,
+    and counting it as one would put a permanent red number beside every release."""
     opener = urllib.request.build_opener(_NoRedirect)
     results = []
-    for name, base_url in entries:
-        url = sync_url(base_url)
-        if url is None:
-            results.append(Result(name, base_url, False, "refused: not an http(s) URL"))
+    for m in mirrors:
+        if payload not in m.payloads:
             continue
-        ok, detail = ping(url, retries, timeout, opener)
-        results.append(Result(name, url, ok, detail))
+        url = sync_url(m.base_url, payload)
+        if url is None:
+            results.append(Result(m.name, m.base_url, False, "refused: not an http(s) URL"))
+            continue
+        ok, detail = post(url, body, retries, timeout, opener)
+        results.append(Result(m.name, url, ok, detail))
     return results
 
 
-def report(results):
+def report(results, payload, skipped):
     """One line per mirror, then the count. -> failures.
 
     All of it on stderr: the exit status is what a workflow reads, and the log is for the person who
@@ -213,13 +264,17 @@ def report(results):
         print("  {} {:<16} {}  {}".format("ok  " if r.ok else "FAIL", r.name, r.url, r.detail),
               file=sys.stderr)
     bad = sum(not r.ok for r in results)
+    tail = "" if not skipped else ", {} carry no {}".format(skipped, payload)
     if not results:
-        print("notify-mirrors: no mirrors published — nothing to ping", file=sys.stderr)
+        print("notify-mirrors: no published mirror carries {} — nothing to ping{}"
+              .format(payload, tail), file=sys.stderr)
     elif bad:
-        print("notify-mirrors: {} mirror(s), {} pinged, {} FAILED — the release is published "
-              "either way".format(len(results), len(results) - bad, bad), file=sys.stderr)
+        print("notify-mirrors: {} mirror(s) carry {}, {} pinged, {} FAILED — the release is "
+              "published either way{}".format(len(results), payload, len(results) - bad, bad, tail),
+              file=sys.stderr)
     else:
-        print("notify-mirrors: {} mirror(s), all pinged".format(len(results)), file=sys.stderr)
+        print("notify-mirrors: {} mirror(s) carry {}, all pinged{}"
+              .format(len(results), payload, tail), file=sys.stderr)
     return bad
 
 
@@ -237,10 +292,13 @@ def _fixture_server():
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_POST(self):
-            self.server.seen.append(self.path)
-            if self.path == "/ok/sync":
-                code = 202
-            elif self.path == "/flaky/sync":
+            body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self.server.seen.append((self.path, self.headers.get("Content-Type"), body))
+            if self.path == "/ok/sync/mod":
+                code = 202                      # the mirror app's "syncing now"
+            elif self.path == "/have/sync/mod":
+                code = 200                      # ...and its "already have that serial"
+            elif self.path == "/flaky/sync/mod":
                 # 500 once, then 202: the retry is what makes this mirror succeed.
                 self.server.flaky += 1
                 code = 500 if self.server.flaky == 1 else 202
@@ -305,46 +363,79 @@ def _selftest():
     try:
         with tempfile.TemporaryDirectory() as tmp:
             def write_list(fname, mirrors, doc=None):
+                """`mirrors` is [(name, base_url)] carrying the mod, or [(name, url, payloads)]."""
                 path = os.path.join(tmp, fname)
                 body = doc if doc is not None else {
                     "format": 1, "payload_id": "mirrors", "serial": 7,
-                    "mirrors": [{"base_url": u, "name": n, "country": "FI", "payloads": ["mod"]}
-                                for n, u in mirrors]}
+                    "mirrors": [{"base_url": m[1], "name": m[0], "country": "FI",
+                                 "payloads": list(m[2]) if len(m) > 2 else ["mod"]}
+                                for m in mirrors]}
                 with open(path, "w", encoding="utf-8", newline="\n") as fh:
                     json.dump(body, fh)
                 return path
 
-            def run(path, *extra):
+            def write_ping(fname, doc):
+                path = os.path.join(tmp, fname)
+                with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                    json.dump(doc, fh, indent=2)
+                    fh.write("\n")
+                return path
+
+            # A real ping document, but not a real signature: nothing in this script verifies one —
+            # a courier that checked would still be a courier — so minting a keypair here would
+            # only make an stdlib-only test depend on `cryptography`. tools/ping.py's own selftest
+            # owns the signature.
+            ping_path = write_ping("ping.json", {
+                "payload": "mod", "serial": "2000042", "key_id": "0011223344556677",
+                "sig": "A" * 86 + "=="})
+            with open(ping_path, "rb") as fh:
+                ping_bytes = fh.read()
+
+            def run(path, *extra, ping_file=ping_path):
                 """-> (exit code, everything it printed)."""
-                p = subprocess.run([sys.executable, me, "notify", "--list", path, *extra],
-                                   capture_output=True)
+                p = subprocess.run([sys.executable, me, "notify", "--ping-file", ping_file,
+                                    "--list", path, *extra], capture_output=True)
                 return p.returncode, (p.stdout + p.stderr).decode("utf-8", "replace")
 
             def lines(out):
                 return [ln for ln in out.splitlines()
                         if ln.startswith("  ok  ") or ln.startswith("  FAIL")]
 
+            def paths():
+                return [p for p, _, _ in srv.seen]
+
             good = write_list("good.json", [("phx-ok", base + "/ok")])
             code, out = run(good)
             ok("a mirror answering 202 is a success, and the run exits 0",
                lambda: assert_(code == 0 and len(lines(out)) == 1 and lines(out)[0].startswith("  ok"),
                                "exit {}, out: {}".format(code, out)))
-            ok("...and it arrived as a POST to <base_url>/sync",
-               lambda: assert_(srv.seen == ["/ok/sync"], "the fixture saw {}".format(srv.seen)))
+            ok("...and it arrived as a POST to <base_url>/sync/<payload>",
+               lambda: assert_(paths() == ["/ok/sync/mod"],
+                               "the fixture saw {}".format(paths())))
+            ok("...carrying the ping file's exact bytes, as application/json",
+               lambda: assert_(srv.seen[0][2] == ping_bytes and srv.seen[0][1] == CONTENT_TYPE,
+                               "the mirror received {!r} as {}".format(srv.seen[0][2],
+                                                                       srv.seen[0][1])))
+
+            have = write_list("have.json", [("phx-have", base + "/have")])
+            code, out = run(have)
+            ok("a mirror answering 200 (it already has that serial) is a success too",
+               lambda: assert_(code == 0 and lines(out) and lines(out)[0].startswith("  ok"),
+                               "exit {}, out: {}".format(code, out)))
 
             flaky = write_list("flaky.json", [("phx-flaky", base + "/flaky")])
             ok("a 500 is retried, and the retry's 202 counts as a ping",
                lambda: assert_(run(flaky, "--retries", "3")[0] == 0, "the retry never happened"))
             ok("...and it took exactly the two attempts the fixture scripted",
-               lambda: assert_(srv.seen.count("/flaky/sync") == 2,
-                               "attempts: {}".format(srv.seen.count("/flaky/sync"))))
+               lambda: assert_(paths().count("/flaky/sync/mod") == 2,
+                               "attempts: {}".format(paths().count("/flaky/sync/mod"))))
 
             missing = write_list("missing.json", [("phx-404", base + "/nope")])
             ok("a 404 is a reported failure, not a failed run",
                lambda: assert_(run(missing)[0] == 0, "a 404 failed the run"))
             ok("a 404 is not retried — it is the mirror's answer",
-               lambda: assert_(srv.seen.count("/nope/sync") == 1,
-                               "attempts: {}".format(srv.seen.count("/nope/sync"))))
+               lambda: assert_(paths().count("/nope/sync/mod") == 1,
+                               "attempts: {}".format(paths().count("/nope/sync/mod"))))
 
             down = write_list("down.json", [("phx-down", dead)])
             ok("a mirror that is not listening is a reported failure, not a failed run",
@@ -358,8 +449,8 @@ def _selftest():
             ok("an ftp:// entry is refused, and refused counts as a failed mirror",
                lambda: assert_(code == 0 and "FAIL" in out, "exit {}, out: {}".format(code, out)))
             ok("...without a request ever being made",
-               lambda: assert_(not any(p.startswith("/ftp") for p in srv.seen),
-                               "the fixture saw {}".format(srv.seen)))
+               lambda: assert_(not any(p.startswith("/ftp") for p in paths()),
+                               "the fixture saw {}".format(paths())))
             ok("a refused entry fails a --strict run",
                lambda: assert_(run(ftp, "--strict")[0] != 0, "--strict exited 0"))
 
@@ -370,12 +461,38 @@ def _selftest():
                lambda: assert_(code == 0 and len(lines(out)) == 3,
                                "exit {}, {} report line(s)".format(code, len(lines(out)))))
             ok("...including the last one, after two failures",
-               lambda: assert_(srv.seen.count("/ok/sync") >= 2, "the last mirror was never pinged"))
+               lambda: assert_(paths().count("/ok/sync/mod") >= 2,
+                               "the last mirror was never pinged"))
+
+            # --- the payload decides WHO is pinged -------------------------------------------
+            others = write_list("others.json", [("phx-launcher", base + "/ok", ["launcher"]),
+                                                ("phx-game", base + "/ok", ["game"])])
+            before = len(srv.seen)
+            code, out = run(others)
+            ok("a mirror that does not carry this payload is not pinged, and is not a failure",
+               lambda: assert_(code == 0 and not lines(out) and "no published mirror carries mod"
+                               in out, "exit {}, out: {}".format(code, out)))
+            ok("...and no request was made to it at all",
+               lambda: assert_(len(srv.seen) == before, "the fixture saw {}".format(paths()[before:])))
+            ok("a mirror carrying several payloads, ours among them, IS pinged",
+               lambda: assert_(run(write_list("multi.json",
+                                              [("phx-multi", base + "/ok", ["game", "mod"])]))[0] == 0
+                               and paths()[-1] == "/ok/sync/mod", "the fixture saw {}".format(paths())))
+            ok("a mixed list pings only the carriers, and says how many it skipped",
+               lambda: assert_("1 mirror(s) carry mod" in run(write_list(
+                   "some.json", [("phx-l", base + "/ok", ["launcher"]),
+                                 ("phx-m", base + "/ok", ["mod"])]))[1], "the count is wrong"))
+
+            no_payloads = write_list("nopayloads.json", None, doc={
+                "format": 1, "serial": 7,
+                "mirrors": [{"base_url": base + "/ok", "name": "phx-old"}]})
+            ok("an entry with no `payloads` is an unreadable list, not a skipped mirror",
+               lambda: assert_(run(no_payloads)[0] != 0, "an entry with no payloads was accepted"))
 
             empty = write_list("empty.json", [])
             code, out = run(empty)
             ok("an empty list is a success that says so",
-               lambda: assert_(code == 0 and "no mirrors published" in out,
+               lambda: assert_(code == 0 and "no published mirror carries mod" in out,
                                "exit {}, out: {}".format(code, out)))
 
             not_a_list = write_list("bogus.json", None, doc={"format": 1, "serial": 7})
@@ -394,8 +511,29 @@ def _selftest():
                lambda: assert_(run(good, "--retries", "0")[0] != 0, "--retries 0 was accepted"))
             ok("--list and --registry name two sources and are refused together",
                lambda: assert_(subprocess.run(
-                   [sys.executable, me, "notify", "--list", good, "--registry", "a/b"],
+                   [sys.executable, me, "notify", "--ping-file", ping_path,
+                    "--list", good, "--registry", "a/b"],
                    capture_output=True).returncode != 0, "two sources were accepted"))
+
+            # --- the ping file is the run's other input, and it fails the same way the list does --
+            ok("notify without --ping-file is a bad argument, not a contentless ping",
+               lambda: assert_(subprocess.run(
+                   [sys.executable, me, "notify", "--list", good],
+                   capture_output=True).returncode != 0, "a ping-less notify was accepted"))
+            before_bad = len(srv.seen)
+            not_a_ping = write_ping("notaping.json", {"payload": "mod", "serial": "2000042"})
+            ok("a file that is not a ping fails the run",
+               lambda: assert_(run(good, ping_file=not_a_ping)[0] != 0, "a half document was sent"))
+            bad_serial = write_ping("badserial.json", {
+                "payload": "mod", "serial": "01", "key_id": "0011223344556677", "sig": "A" * 88})
+            ok("a ping whose serial is not the one canonical spelling fails the run",
+               lambda: assert_(run(good, ping_file=bad_serial)[0] != 0, "'01' was delivered"))
+            ok("a --ping-file that does not exist fails the run",
+               lambda: assert_(run(good, ping_file=os.path.join(tmp, "no-such.json"))[0] != 0,
+                               "a missing ping exited 0"))
+            ok("...and none of those three reached a mirror",
+               lambda: assert_(len(srv.seen) == before_bad,
+                               "the fixture saw {}".format(paths()[before_bad:])))
     finally:
         srv.shutdown()
         srv.server_close()
@@ -420,7 +558,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    n = sub.add_parser("notify", help="ping every published mirror")
+    n = sub.add_parser("notify", help="ping every published mirror that carries this payload")
+    # Required, and there is no --payload beside it: the payload id comes out of the SIGNED
+    # document, so the thing that decides which mirrors are contacted is the same thing the mirror
+    # itself verifies. A flag would be a second, unsigned answer to that question.
+    n.add_argument("--ping-file", required=True, metavar="PATH",
+                   help="the signed ping tools/ping.py minted for this release")
     src = n.add_mutually_exclusive_group()
     src.add_argument("--registry", default=REGISTRY,
                      help="owner/name whose latest release carries {} (default: %(default)s)"
@@ -450,17 +593,24 @@ def main():
         die("--timeout must be positive")
 
     try:
+        # The ping first: a release nobody can describe is not one to start contacting hosts about,
+        # and an unreadable ping file is this repo's problem rather than a mirror's.
+        pdoc, body = ping.read_file(a.ping_file)
+        payload = pdoc["payload"]
         doc = load_list(a.list_path) if a.list_path else fetch_list(
             a.registry, a.timeout, os.environ.get(a.token_env))
-        entries = mirror_entries(doc)
-    except NotifyError as e:
+        mirrors = mirror_entries(doc)
+    except (NotifyError, ping.PingError) as e:
         # The one non-zero exit that is not about a mirror: nothing was pinged, and that is this
         # repo's problem rather than a host's.
         die(str(e))
 
-    print("notify-mirrors: {} — serial {}, {} mirror(s)".format(
-        a.list_path or a.registry, doc.get("serial", "?"), len(entries)), file=sys.stderr)
-    bad = report(notify(entries, a.retries, a.timeout))
+    carrying = [m for m in mirrors if payload in m.payloads]
+    print("notify-mirrors: {} — list serial {}, {} mirror(s); pinging {} for {} serial {}".format(
+        a.list_path or a.registry, doc.get("serial", "?"), len(mirrors), len(carrying),
+        payload, pdoc["serial"]), file=sys.stderr)
+    bad = report(notify(mirrors, payload, body, a.retries, a.timeout),
+                 payload, len(mirrors) - len(carrying))
     sys.exit(1 if bad and a.strict else 0)
 
 
