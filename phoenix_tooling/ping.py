@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """The mirror ping — a SIGNED, serial-bound "payload X is at serial N" that anyone may deliver.
 
-    python tools/ping.py sign   --payload mod --serial 2000042 --out ping.json
-    python tools/ping.py verify ping.json --pub keys/phoenix-active.pub
-    python tools/ping.py ledger --payload mod --sealed <a checkout of the `sealed` branch>
-    python tools/ping.py selftest
+    python phx.py ping sign   --payload mod --serial 2000042 --out ping.json
+    python phx.py ping verify ping.json --pub keys/phoenix-active.pub
+    python phx.py ping ledger --payload mod --sealed <a checkout of the `sealed` branch>
+    python phx.py ping selftest
 
-WHY IT IS SIGNED. tools/notify_mirrors.py used to POST an empty body to an unauthenticated
+WHY IT IS SIGNED. phoenix_tooling/notify.py used to POST an empty body to an unauthenticated
 endpoint, and that was sound while the ping SAID nothing: the worst a forgery bought was a sync the
 forger could have asked for himself. The ping now carries a SERIAL, and a mirror uses that number
 to decide whether it is behind. An unsigned number is a claim a mirror acts on -- one forged
@@ -31,7 +31,7 @@ THE MESSAGE IS A WIRE CONTRACT, re-derived byte for byte by the mirror app (phoe
     reader compares the strings or the integers.
 
 NOT A .minisig, and not a second signing format either. A .minisig signs a FILE's exact bytes and
-carries a trusted comment (see phoenix_minisign.py); here the signed thing is not a file at all --
+carries a trusted comment (see minisign.py); here the signed thing is not a file at all --
 it is two short fields the reader RE-DERIVES from JSON it parsed, so there are no framing bytes to
 agree on. What is shared with .minisig is everything that matters: the same pure-Ed25519 primitive
 and the same release key. `verify` refuses a .minisig envelope offered as a `sig` (it is not 64
@@ -42,8 +42,9 @@ THE SERIAL IS A STRING in the JSON. A serial is a u64 and the mirror app is Type
 reader unharmed, and the signed message is built from that same text.
 
 STDLIB ONLY UNLESS IT SIGNS. `cryptography` is imported inside `sign`/`verify`, never at module
-scope, because `ledger` runs in each PRODUCER's CI -- before (and instead of) any wheel install --
-to pick the next serial. See `ledger_high`.
+scope, because `ledger` runs in the signing authority's job BEFORE the signing wheel is installed
+-- assigning the next serial is a gate, and a request refused at a gate installs nothing. See
+`ledger_high`.
 """
 import argparse
 import base64
@@ -53,18 +54,18 @@ import re
 import sys
 from typing import NoReturn
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import manifest_schema as schema  # noqa: E402  -- for U64_MAX only; this module imports nothing
+from . import manifest_schema as schema   # for U64_MAX only; this module imports nothing
 
 # --- the wire contract: the signed message ---------------------------------------------------------
 
 MAGIC = b"phoenix-ping"
 SEP = b"\n"
 PAYLOAD_RE = re.compile(r"\A[a-z]+\Z")
-# No sign, no leading zero, no '.', no exponent -- and no zero: the ledger reads an empty ledger as
-# 0 and the ratchet is strictly-greater, so serial 0 is a number no payload can ever be sealed at.
-# (The FORMAT allows it -- manifest_schema's `serial` is Int(min=0) -- because that is the widest
-# honest statement about a u64; refusing it is the signing authority's rule, not the format's.)
+# No sign, no leading zero, no '.', no exponent -- and no zero: an empty ledger reads as 0 and the
+# authority assigns one above it, so 0 is a number no payload is ever sealed at. That is exactly
+# what makes it usable as the "no release yet" marker a seal request carries. (The FORMAT allows it
+# -- manifest_schema's `serial` is Int(min=0) -- because that is the widest honest statement about a
+# u64; refusing it here is what a ping means, not what the format says.)
 SERIAL_RE = re.compile(r"\A[1-9][0-9]*\Z")
 
 # The ping document. Exactly these four keys, no more: a reader that ignores unknown keys cannot
@@ -73,23 +74,40 @@ SERIAL_RE = re.compile(r"\A[1-9][0-9]*\Z")
 FIELDS = ("payload", "serial", "key_id", "sig")
 
 SIG_LEN = 64                  # a raw Ed25519 signature
-KEY_ID_LEN = 8                # phoenix_minisign's key id, hex-encoded in the document
+KEY_ID_LEN = 8                # minisign's key id, hex-encoded in the document
 
 # --- the ledger: where a sealed payload's serial is recorded ---------------------------------------
 
-# The sealing workflow commits `<LEDGER_DIR>/<owner>/<name>/<tag>/{<document>.minisig,ping.json}` to
-# the branch `sealed`, where <document> is the file that was sealed -- `manifest.json` for a payload
-# manifest, `mirrors.json` for the mirror list. These names are part of what the producers fetch, so
-# they live here rather than in the workflow that writes them; and because the signature is named
-# after the DOCUMENT, what a ledger entry can be checked for is the SUFFIX, never one filename.
+# The sealing workflow commits `<LEDGER_DIR>/<owner>/<name>/<tag>/{<document>,<document>.minisig,
+# ping.json}` to the branch `sealed`, where <document> is the file that was sealed -- see
+# `document_name` below. The document itself is there because the authority is what WRITES the
+# serial into it: the bytes that were signed are the answer, not merely a signature over bytes the
+# producer already had. These names are part of what the producers fetch, so they live here rather
+# than in the workflow that writes them; and because the signature is named after the DOCUMENT,
+# what a ledger entry can be checked for is the SUFFIX, never one filename.
 LEDGER_DIR = "sealed"
 PING_NAME = "ping.json"
 SIG_SUFFIX = ".minisig"
 
+# The one document kind that is not a payload manifest: the mirror registry's list. It is not a
+# manifest_schema.PAYLOAD_ID and never will be (see the docstring), so the name it seals under is
+# the only thing that has to be agreed on, and it is agreed on HERE -- the authority writes the
+# entry (.github/workflows/seal.yml) and the producer reads it back (phoenix_tooling/dispatch.py),
+# and a name each side spelled for itself would be a ledger entry only one of them could find.
+MIRRORS = "mirrors"
+MANIFEST_DOCUMENT = "manifest.json"
+DOCUMENTS = {MIRRORS: "mirrors.json"}
+
+
+def document_name(payload_id):
+    """-> the filename this payload's sealed document is filed under, in the ledger and on the
+    release. Everything but the mirror list is a payload manifest."""
+    return DOCUMENTS.get(payload_id, MANIFEST_DOCUMENT)
+
 
 class PingError(Exception):
     """Every way a ping can fail to be produced, read or believed -- one type, for the reason
-    phoenix_minisign.MinisignError is one type: a caller that catches "malformed" separately from
+    minisign.MinisignError is one type: a caller that catches "malformed" separately from
     "did not verify" eventually treats one of them as benign."""
 
 
@@ -100,7 +118,7 @@ def die(msg) -> NoReturn:
 # --- the message ----------------------------------------------------------------------------------
 
 def check_payload(value):
-    """-> the payload id, or PingError. The same rule the sync route needs (see notify_mirrors)."""
+    """-> the payload id, or PingError. The same rule the sync route needs (see notify)."""
     if not isinstance(value, str) or not PAYLOAD_RE.match(value):
         raise PingError(f"payload {value!r} is not [a-z]+")
     return value
@@ -139,7 +157,7 @@ def message(payload, serial):
 def check_doc(doc):
     """Structure only -- no signature. -> (payload, serial text), or PingError.
 
-    Split out from `verify` because two callers need the fields WITHOUT the key: notify_mirrors,
+    Split out from `verify` because two callers need the fields WITHOUT the key: notify,
     which only has to know which mirrors a ping is for, and the ledger below, which runs in a
     producer's CI where `cryptography` is not installed."""
     if not isinstance(doc, dict):
@@ -155,7 +173,7 @@ def check_doc(doc):
 
 def sign(payload, serial, secret_key):
     """-> the ping document, signed by `secret_key` (the .key file's text)."""
-    import phoenix_minisign as pm                     # lazy: see the module docstring
+    from . import minisign as pm                      # lazy: see the module docstring
 
     p, s = check_payload(payload), check_serial(serial)
     try:
@@ -170,9 +188,9 @@ def sign(payload, serial, secret_key):
 def verify(doc, public_keys):
     """-> (payload, serial as int), or PingError. `public_keys` is the trust root: .pub file texts.
 
-    Like phoenix_minisign.verify, the key_id only SELECTS among the ring -- it is a hint, not a
+    Like minisign.verify, the key_id only SELECTS among the ring -- it is a hint, not a
     credential."""
-    import phoenix_minisign as pm                     # lazy: see the module docstring
+    from . import minisign as pm                      # lazy: see the module docstring
     from cryptography.exceptions import InvalidSignature
 
     payload, serial = check_doc(doc)
@@ -212,7 +230,7 @@ def verify(doc, public_keys):
 
 
 def read_file(path):
-    """-> (document, its exact bytes). notify_mirrors POSTS those bytes, so it must not
+    """-> (document, its exact bytes). notify POSTS those bytes, so it must not
     re-serialise what it read: the file a mirror receives is the file that was committed."""
     try:
         with open(path, "rb") as fh:
@@ -246,7 +264,12 @@ def ledger_entries(root):
     one `*.minisig` -- the signature is named after the DOCUMENT it covers, which differs by kind
     (see SIG_SUFFIX), so the rule cannot be one filename without the ledger refusing every entry
     whose document is not a manifest. Either half missing is a PingError rather than a skip -- see
-    ledger_high."""
+    ledger_high.
+
+    The DOCUMENT is not required, though every seal now writes one: entries sealed before it was
+    part of an answer carry only these two files, and they are perfectly good ledger lines -- the
+    serial in them was spent. What the missing document costs them is only the authority's
+    idempotency check, which then reads such an entry as "not sealed the way I would seal it"."""
     out = []
     for owner in sorted(_subdirs(root)):
         for name in sorted(_subdirs(os.path.join(root, owner))):
@@ -282,23 +305,25 @@ def _files(path):
 def ledger_high(path, payload):
     """-> the highest serial ever sealed for `payload`, or 0 if none ever was.
 
-    THE RATCHET READS THIS, at the signing authority: a manifest whose serial is not strictly
-    greater is refused, so one payload line can never be sealed at a number it already used --
-    including on a rebuild of a tag that was already sealed.
+    THE SIGNING AUTHORITY READS THIS, and it is the only thing that does so to decide a number:
+    the serial it assigns is `this + 1` (.github/workflows/seal.yml), so one payload line can never
+    be sealed at a number it already used -- including on a rebuild of a tag that was already
+    sealed, and including a number that was sealed but never published. A producer used to compute
+    the same thing for itself and no longer does: it sends a document at serial 0 and is handed
+    back the one it was sealed at.
 
-    THE PRODUCERS READ IT TOO, and must: a producer picks `max(this, the published serial) + 1`.
-    "Published + 1" alone was correct only while sealing and publishing were the same job. They are
-    not any more -- a payload job can be sealed at N and then die before it undrafts, leaving N
-    sealed and nothing published, after which "published + 1" proposes N forever and this ratchet
-    correctly refuses it forever. That is why this function is a CLI subcommand and why it must not
-    need `cryptography`: it runs in a producer's CI, before any wheel install.
+    Nothing else reads it to decide anything. A person reads it (`phx ping ledger`) to see where a
+    line stands; the mirror app never sees the ledger at all -- what it acts on is the signed ping.
+    It must still not need `cryptography`: it runs in the authority's job BEFORE the signing wheel
+    is installed, which is deliberate (a request refused at the gates installs nothing), and the
+    rehearsal drives that same step with nothing installed at all.
 
-    A malformed entry is REFUSED, never skipped, because this number is the whole ratchet: the one
+    A malformed entry is REFUSED, never skipped, because this number is the whole counter: the one
     thing an unreadable entry could be hiding is a serial higher than the one we would otherwise
     return, and skipping it silently lowers the high-water mark. What the ledger is NOT is
     self-authenticating -- nothing here checks the ping signatures it reads (that would need the
     signer, and this must stay stdlib-only). Its integrity is a property of who may push to the
-    `sealed` branch; see docs/sealing.md."""
+    `sealed` branch; see docs/publishing.md."""
     check_payload(payload)
     high = 0
     for rel, doc in ledger_entries(ledger_root(path)):
@@ -312,10 +337,10 @@ def ledger_high(path, payload):
 
 def _selftest():
     """Keys are minted here and thrown away -- a fixed test key in the repo is a private key in the
-    repo (the rule phoenix_minisign's selftest states)."""
+    repo (the rule minisign's selftest states)."""
     import tempfile
 
-    import phoenix_minisign as pm
+    from . import minisign as pm
 
     results = []
 
@@ -419,8 +444,13 @@ def _selftest():
     # --- the ledger ------------------------------------------------------------------------------
     # The two document names the sealing authority writes -- see SIG_SUFFIX. The ledger must read
     # both, which is why its rule is the suffix rather than either of these strings.
-    manifest_sig = "manifest.json" + SIG_SUFFIX
-    mirrors_sig = "mirrors.json" + SIG_SUFFIX
+    ok("every payload line but the mirror list seals a manifest",
+       lambda: assert_({document_name(p) for p in ("mod", "launcher", "game")}
+                       == {MANIFEST_DOCUMENT}, "a payload line seals something else"))
+    ok("the mirror list seals under its own name",
+       lambda: assert_(document_name(MIRRORS) == "mirrors.json", document_name(MIRRORS)))
+    manifest_sig = document_name("mod") + SIG_SUFFIX
+    mirrors_sig = document_name(MIRRORS) + SIG_SUFFIX
 
     with tempfile.TemporaryDirectory() as tmp:
         def write_entry(repo, tag, payload, serial, body=None, sig_name=manifest_sig):
@@ -448,7 +478,7 @@ def _selftest():
         write_entry("Pr0j3ctPh03nix/phoenix-launcher", "v1.5.2", "launcher", 3_000_009)
         # The mirror registry seals a document that is not a manifest, so its entry's signature is
         # named mirrors.json.minisig. It is a sealed entry like any other and the ledger must read
-        # it -- the ratchet the registry counts from is this number.
+        # it -- the number the authority counts that line from is this one.
         write_entry("Pr0j3ctPh03nix/phoenix-mirror-registry", "v2", "mirrors", 2,
                     sig_name=mirrors_sig)
         with open(os.path.join(tmp, LEDGER_DIR, "README.md"), "w", encoding="utf-8") as fh:
@@ -498,11 +528,15 @@ def _read_text(path):
         return fh.read()
 
 
-def main():
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+def main(argv=None):
+    # newline="\n" on STDOUT, for the two things that go there: `ledger`'s bare number, which a
+    # workflow captures with $(...) -- Windows text mode would leave the CR on the end of it, since
+    # command substitution strips only the LF -- and `sign` without --out, whose bytes are a ping
+    # document that must be the same on every platform. stderr is read by people.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace", newline="\n")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap = argparse.ArgumentParser(prog="phx ping", description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("sign", help="sign a (payload, serial) ping with the release key")
@@ -524,7 +558,7 @@ def main():
                     help="a checkout of the `sealed` branch (or its sealed/ directory)")
 
     sub.add_parser("selftest", help="check the ping rules and the ledger against each other")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
 
     if a.cmd == "selftest":
         sys.exit(1 if _selftest() else 0)

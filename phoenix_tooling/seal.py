@@ -8,8 +8,8 @@ already drifted: only two refused to publish unsigned, and each handled the key 
 payload is either sealed the way every other payload is sealed, or it is a special case nobody
 remembers when the rules change.
 
-    python tools/seal.py seal --manifest staging/manifest.json \\
-        --pub tools/phoenix-release.pub --trusted-comment "phoenix mod v1.2.3"
+    python phx.py seal seal --manifest staging/manifest.json \\
+        --pub keys/phoenix-active.pub --trusted-comment "phoenix mod v1.2.3"
 
 THE ORDER IS THE POINT, and it is why this is one command rather than steps a caller sequences
 itself:
@@ -21,29 +21,27 @@ itself:
      perfectly and is refused by every client, and the only symptom is an update channel that has
      silently died.
 
-There used to be a VALIDATE step before signing, run through tools/validate_manifest.py on a
-different code path than the producer that wrote the document — a signature over a broken manifest
-was a promise that the broken thing was genuinely ours. That code path no longer exists: every
-manifest this repo signs now comes out of tools/build_manifest.py's build(), which cannot RETURN a
-document violating the format (most of what the old validator checked is not an expressible input
-any more; see that module's docstring). A document a builder produced cannot be invalid, so sealing
-is sign -> prove, not validate -> sign -> prove.
+There used to be a VALIDATE step before signing, run through validate_manifest.py on a different
+code path than the producer that wrote the document — a signature over a broken manifest was a
+promise that the broken thing was genuinely ours. That code path no longer exists: every manifest
+this repo signs now comes out of phoenix_tooling/build_manifest.py's build(), which cannot RETURN
+a document violating the format (most of what the old validator checked is not an expressible
+input any more; see that module's docstring). A document a builder produced cannot be invalid, so
+sealing is sign -> prove, not validate -> sign -> prove.
 
 THE KEY NEVER TOUCHES THE DISK in CI. `--key-env` (default PHOENIX_SIGNING_KEY) reads the secret
 straight from the environment, so there is no keyfile to leak between the write and the delete, and
 no `trap` to get wrong. `--sec` is for the by-hand game build, where the key is a file on an
 offline machine and that is the whole point.
 
-Stdlib plus `cryptography` (through phoenix_minisign), so it ships to dist via sync.py's DEV_TOOLS
-and every CI reads exactly one copy of it.
+Stdlib plus `cryptography` (through minisign).
 """
 import argparse
 import os
 import sys
 from typing import NoReturn
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import phoenix_minisign  # noqa: E402
+from . import minisign
 
 
 def die(msg) -> NoReturn:
@@ -65,8 +63,8 @@ def seal(manifest_path, pub_path, trusted_comment, secret_text, sig_path=None):
 
     # 1. the bytes as they sit on disk
     try:
-        sig_text = phoenix_minisign.sign(data, secret_text, trusted_comment=trusted_comment)
-    except phoenix_minisign.MinisignError as e:
+        sig_text = minisign.sign(data, secret_text, trusted_comment=trusted_comment)
+    except minisign.MinisignError as e:
         die("signing failed: {}".format(e))
     # The reader finds a signature by appending this to the document's asset name (trust.rs
     # SIG_SUFFIX); it is part of the contract, not a local naming choice.
@@ -77,13 +75,14 @@ def seal(manifest_path, pub_path, trusted_comment, secret_text, sig_path=None):
     # 2. and prove it, against the half that ships
     if not os.path.isfile(pub_path):
         die("no such public key: {}\n"
-            "  It is synced from the dev superset (sync.py DEV_TOOLS). A checkout without it means "
-            "the superset was not synced before this release.".format(pub_path))
+            "  The published halves live in this repository's keys/, which is a promised stable "
+            "path — pass keys/phoenix-active.pub from the checkout that is sealing.".format(
+                pub_path))
     with open(pub_path, encoding="utf-8", newline="") as fh:
         pub = fh.read()
     try:
-        key_id = phoenix_minisign.verify(data, sig_text, [pub])
-    except phoenix_minisign.MinisignError as e:
+        key_id = minisign.verify(data, sig_text, [pub])
+    except minisign.MinisignError as e:
         die("the signature just written does not verify against {}: {}\n"
             "  The signing key and the published public key disagree. Every client would refuse "
             "this release, and the only symptom would be that no update ever appears."
@@ -96,9 +95,9 @@ def seal(manifest_path, pub_path, trusted_comment, secret_text, sig_path=None):
     return out, key_id.hex()
 
 
-def main():
+def main(argv=None):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap = argparse.ArgumentParser(prog="phx seal", description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("seal", help="sign and verify a payload manifest")
@@ -110,7 +109,7 @@ def main():
     s.add_argument("--key-env", default="PHOENIX_SIGNING_KEY",
                    help="env var holding the secret key text (default: %(default)s)")
     s.add_argument("--out", help="signature path (default: <manifest>.minisig)")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
 
     if a.sec:
         if not os.path.isfile(a.sec):

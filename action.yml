@@ -1,0 +1,440 @@
+# PHOENIX PUBLISH — the whole of what a producer does after it has built its payload.
+#
+#     - uses: Pr0j3ctPh03nix/phoenix-release-tooling@v1
+#       with:
+#         tag: ${{ github.ref_name }}
+#         document: staging/manifest.json
+#         assets: staging
+#         notes-file: release-notes.md
+#         token: ${{ github.token }}
+#         dispatch-token: ${{ secrets.PHOENIX_TOOLING_DISPATCH }}
+#
+# Every producer used to spell out the same ~150 lines: draft the release, dispatch, wait, verify,
+# upload the signature, undraft, ping the mirrors. Three copies of one choreography is three places
+# for it to be subtly different, and the differences were real (one checked the serial before the
+# signature, one after; one fetched the ledger with `git show`, one with `cat-file`). It is one
+# step now, and the internals of this repository — phx.py, the ledger's layout, the wheels — stop
+# being anything a consumer names.
+#
+# WHAT THIS PROMISES
+#   * It holds NO KEY. It asks .github/workflows/seal.yml, which is the only thing that has one.
+#   * It cannot publish an unsigned or wrongly-signed release: the release is created as a DRAFT and
+#     is undrafted only after the sealed document and its signature have been fetched, PROVEN
+#     against this checkout's keys/phoenix-active.pub (`phx dispatch await`, checks (a)..(d)), and
+#     attached. Every failure before that leaves a draft, which no client can see.
+#   * It cannot publish over a finished release: a tag that already carries a PUBLISHED release is
+#     refused before anything is created, uploaded or dispatched.
+#   * A re-run is free. It reuses its own draft, and the authority answers an identical request with
+#     the entry it already has — nothing is signed again and no serial is spent. That is what makes
+#     a job that died between the seal and the undraft recoverable by pressing re-run.
+#   * A mirror that is down never reddens a shipped release: the ping is delivered after the
+#     undraft, and its outcome is reported, not raised.
+#
+# WHAT IT DOES NOT
+#   * It does not build anything, and it does not know what a payload is. `document` is a finished
+#     seal request and `assets` is a directory of finished files.
+#   * It does not choose the serial — nothing outside the authority does. The number comes back.
+#   * It does not sign, verify or publish the BASE GAME: that line is sealed by hand, offline, and
+#     never dispatches (docs/publishing.md).
+#   * It does not attach the request document. What goes up is the SEALED document that came back.
+#
+# `@v1` IS A MOVING TAG (see .github/workflows/ci.yml). It advances on every green push to `main`,
+# so what a consumer gets — including the public key `dispatch await` proves the answer against — is
+# whatever `v1` points at when its workflow runs. An incompatible change to the inputs or outputs
+# below is `v2`.
+#
+# NEVER interpolate `${{ }}` into a `run:` block, the same rule seal.yml states: it is textual
+# substitution performed before bash parses the script, and a tag name or a title is then executable
+# code. Everything arrives through `env:` and is read back as "$VAR".
+name: Phoenix publish
+description: Publish a Phoenix payload — draft, seal it through the signing authority, verify, release, ping the mirrors.
+
+inputs:
+  tag:
+    description: "The release tag. Also the key this seal is filed under in the authority's ledger."
+    required: true
+  document:
+    description: "The seal request: a payload manifest or a mirror list, carrying serial 0."
+    required: true
+  assets:
+    description: >-
+      A directory. Every regular file directly in it is attached to the release. The request
+      document is skipped if it lives there — the sealed one replaces it.
+    required: false
+    default: ""
+  notes-file:
+    description: "Markdown for the release body. Absent means an empty body."
+    required: false
+    default: ""
+  title:
+    description: "The release title. Defaults to the tag."
+    required: false
+    default: ""
+  token:
+    description: "The producer's own GITHUB_TOKEN, with contents: write. Used only for its own releases."
+    required: true
+  dispatch-token:
+    description: >-
+      A fine-grained PAT scoped to this repository with Actions: write, which is all a dispatch
+      needs. Required unless dry-run.
+    required: false
+    default: ""
+  trusted-comment:
+    description: "Signed and therefore quotable. Defaults to `phoenix <payload_id> <tag>`."
+    required: false
+    default: ""
+  dry-run:
+    description: "'true' validates the request and stops: nothing is created, uploaded or dispatched."
+    required: false
+    default: "false"
+
+outputs:
+  serial:
+    description: "The serial the authority assigned. Empty on a dry run."
+    value: ${{ steps.seal.outputs.serial }}
+  release-url:
+    description: "The release this published to. Empty on a dry run."
+    value: ${{ steps.release.outputs.url }}
+  plan:
+    description: >-
+      On a dry run, the one line describing what a real run would publish; empty otherwise. It is
+      what makes a dry run assertable by the caller, which is the only way this action is exercised
+      before a producer uses it for real (.github/workflows/ci.yml).
+    value: ${{ steps.check.outputs.plan }}
+
+runs:
+  using: composite
+  steps:
+    # FROM THIS ACTION'S OWN wheels/, NOT FROM AN INDEX — wheels/README.md owns the argument. Here
+    # it buys one more thing: the producer's job installs exactly what the authority's does, from
+    # the same tree, so "the signature verifies" means the same on both sides of the boundary.
+    # First, so a broken install fails before a release exists rather than after.
+    - name: Install the signature verifier
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        python -m pip install --disable-pip-version-check --no-index \
+          --find-links "$ACTION_PATH/wheels" cryptography
+
+    # Read the request once, and decide everything that depends on what is in it: which payload
+    # line this is, what the sealed document will be called, what the trusted comment says, and
+    # which files are the release's assets. Nothing below re-opens the document to ask.
+    - name: Read the request
+      id: request
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        TAG: ${{ inputs.tag }}
+        DOCUMENT: ${{ inputs.document }}
+        ASSETS: ${{ inputs.assets }}
+        TRUSTED_COMMENT: ${{ inputs.trusted-comment }}
+      run: |
+        set -euo pipefail
+        export ASSET_LIST="$RUNNER_TEMP/phx-assets.txt"
+        # ASCII ONLY IN THIS BLOCK, comments included, in BOTH directions: bash feeds it to
+        # `python -` on stdin, whose source a WINDOWS runner decodes with the console codepage
+        # (cp1252), where several UTF-8 continuation bytes are undefined — an em dash in a comment
+        # is a UnicodeDecodeError before the first line runs, and one in a message replaces the
+        # reason the run failed.
+        python - <<'PY'
+        import os, sys
+
+        sys.path.insert(0, os.environ["ACTION_PATH"])
+        from phoenix_tooling import build_manifest, ping
+
+        def fail(why):
+            sys.exit("phoenix publish: " + why)
+
+        # .get, not [..]: an input left at its empty default may reach the step as an unset
+        # variable, and "there is no tag" deserves the message below rather than a KeyError.
+        def arg(name):
+            return os.environ.get(name, "").strip()
+
+        tag, doc_path = arg("TAG"), arg("DOCUMENT")
+        # `required: true` on an input is advisory - the runner does not enforce it - so the two
+        # things without which there is nothing to do are checked here.
+        if not tag:
+            fail("`tag` is required: it is the release tag and the authority's ledger key.")
+        if not doc_path:
+            fail("`document` is required: it is the seal request.")
+        if not os.path.isfile(doc_path):
+            fail("no such document: " + doc_path)
+
+        with open(doc_path, "rb") as fh:
+            raw = fh.read()
+        # build_manifest.parse, not json.loads: this is the reader every side of the boundary uses,
+        # and a document two parsers could disagree about is not one to start publishing.
+        try:
+            doc = build_manifest.parse(raw)
+        except Exception as e:                     # noqa: BLE001 - unreadable is unreadable
+            fail("%s is not a document this repo will read: %s: %s"
+                 % (doc_path, type(e).__name__, e))
+        payload = doc.get("payload_id")
+        if not isinstance(payload, str) or not payload:
+            fail(doc_path + " names no payload_id, so there is nothing to publish it as.")
+
+        comment = arg("TRUSTED_COMMENT") or ("phoenix %s %s" % (payload, tag))
+        # GITHUB_OUTPUT is line-based, so a newline here would be an injected output rather than a
+        # refusal. The rest of the rule - printable ASCII, 200 characters - is the authority's, and
+        # is checked there.
+        if "\n" in comment or "\r" in comment:
+            fail("`trusted-comment` must be one line.")
+
+        # Top level only, regular files only: `assets` names a directory of finished files to
+        # attach, not a tree to walk. The request document is skipped wherever in it it sits -
+        # what gets attached is the SEALED document, after the seal comes back.
+        assets, files = arg("ASSETS"), []
+        if assets:
+            if not os.path.isdir(assets):
+                fail("no such assets directory: " + assets)
+            for name in sorted(os.listdir(assets)):
+                path = os.path.join(assets, name)
+                if os.path.isfile(path) and not os.path.samefile(path, doc_path):
+                    files.append(path)
+
+        # Forward slashes even on windows, where os.path.join produces backslashes: this list is
+        # read back by bash, which treats a backslash as an escape, and gh takes either.
+        with open(os.environ["ASSET_LIST"], "w", encoding="utf-8", newline="\n") as fh:
+            for path in files:
+                fh.write(path.replace(os.sep, "/") + "\n")
+        # newline="\n" on both: a CRLF written into GITHUB_OUTPUT on a windows runner leaves the CR
+        # inside the value.
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8", newline="\n") as fh:
+            for k, v in (("payload", payload),
+                         ("document_name", ping.document_name(payload)),
+                         ("trusted_comment", comment),
+                         ("assets", len(files)),
+                         ("bytes", len(raw))):
+                fh.write("%s=%s\n" % (k, v))
+        print("%s: payload %s, %d bytes, %d asset(s) to attach, sealing as %s"
+              % (doc_path, payload, len(raw), len(files), ping.document_name(payload)))
+        PY
+
+    # THE ONE GATE THAT COSTS NOTHING TO FAIL, and therefore runs before anything exists: the same
+    # check the authority makes before it reads the key. `dispatch send --dry-run` refuses a
+    # document this repo's builder would not have produced, one that already names a serial, and one
+    # too large for a dispatch - each of which, discovered later, is a refusal arriving after the
+    # draft release is already up.
+    - name: Validate the seal request
+      id: check
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        TAG: ${{ inputs.tag }}
+        DOCUMENT: ${{ inputs.document }}
+        TRUSTED_COMMENT: ${{ steps.request.outputs.trusted_comment }}
+        PAYLOAD: ${{ steps.request.outputs.payload }}
+        ASSET_COUNT: ${{ steps.request.outputs.assets }}
+        DOC_BYTES: ${{ steps.request.outputs.bytes }}
+        DRY_RUN: ${{ inputs.dry-run }}
+        # The token's PRESENCE, never the token: an expression, so nothing secret enters this
+        # step's environment to be echoed by a `set -x` somebody adds later.
+        HAVE_DISPATCH_TOKEN: ${{ inputs.dispatch-token != '' }}
+      run: |
+        set -euo pipefail
+        python "$ACTION_PATH/phx.py" dispatch send --dry-run \
+          --repo "$GITHUB_REPOSITORY" --tag "$TAG" --document "$DOCUMENT" \
+          --trusted-comment "$TRUSTED_COMMENT"
+
+        plan="would publish $TAG: payload $PAYLOAD, $ASSET_COUNT assets, request of $DOC_BYTES bytes"
+        if [ "$DRY_RUN" = "true" ]; then
+          # Every step below skips on this output. A dry run is a SUCCESS that published nothing,
+          # so it must not be a failure and must not be a silent no-op either.
+          {
+            echo "plan=$plan"
+            echo "stop=1"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Phoenix publish - dry run"
+            echo
+            echo "$plan"
+            echo
+            echo "Nothing was created, uploaded or dispatched."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "$plan"
+          exit 0
+        fi
+        test "$HAVE_DISPATCH_TOKEN" = "true" || {
+          echo "REFUSED: 'dispatch-token' is empty, so nobody can be asked to sign this release -"
+          echo "and no producer holds a key to sign it with. Mint a fine-grained PAT scoped to"
+          echo "Pr0j3ctPh03nix/phoenix-release-tooling with Actions: write and pass it here."
+          echo "See docs/publishing.md."
+          exit 1
+        }
+        echo "$plan" | sed 's/^would publish/publishing/'
+
+    # THE DRAFT. Invisible to `releases/latest`, which is every client's entry point, so nothing a
+    # client can see exists until the last step but one.
+    #
+    # Only `gh release` subcommands are used here, never `gh api`: they take no API path, and a
+    # leading-slash endpoint under `shell: bash` on a WINDOWS runner is rewritten by MSYS into
+    # `C:/Program Files/Git/repos/...` and refused - after the draft is already up. That trap cost
+    # two releases; this file cannot step in it.
+    - name: Create or reuse the draft release
+      id: release
+      if: steps.check.outputs.stop != '1'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        TAG: ${{ inputs.tag }}
+        TITLE: ${{ inputs.title }}
+        NOTES_FILE: ${{ inputs.notes-file }}
+      run: |
+        set -euo pipefail
+        title="$TITLE"
+        if [ -z "$title" ]; then title="$TAG"; fi
+
+        # gh's own --jq, so no jq binary has to be on the runner. A view that fails for any other
+        # reason than "no such release" is read as "none" here and then fails closed one line
+        # later: `gh release create` refuses a tag that already has a release.
+        state=""
+        if state=$(gh release view "$TAG" --json isDraft,url --jq '[.isDraft, .url] | @tsv' 2>/dev/null); then
+          draft=${state%%$'\t'*}
+          url=${state#*$'\t'}
+          if [ "$draft" != "true" ]; then
+            echo "REFUSED: $TAG is already released - $url"
+            echo "Publishing into a finished release would change what clients have already been"
+            echo "given, under a tag they have already seen. Cut a new tag."
+            exit 1
+          fi
+          echo "reusing the draft already at $url"
+        else
+          notes=(--notes "")
+          if [ -n "$NOTES_FILE" ]; then notes=(--notes-file "$NOTES_FILE"); fi
+          # --target: if the tag does not exist yet, it is created at the commit THIS run built,
+          # never at the default branch's head. GitHub ignores it when the tag already exists,
+          # which is the usual case (a tag push is what started the producer's workflow).
+          url=$(gh release create "$TAG" --draft --target "$GITHUB_SHA" --title "$title" "${notes[@]}")
+          echo "created the draft $url"
+        fi
+        echo "url=$url" >> "$GITHUB_OUTPUT"
+
+    # --clobber, because a re-run attaches the same names to the draft it is reusing.
+    - name: Attach the payload's assets
+      if: steps.check.outputs.stop != '1'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        TAG: ${{ inputs.tag }}
+      run: |
+        set -euo pipefail
+        mapfile -t files < "$RUNNER_TEMP/phx-assets.txt"
+        if [ "${#files[@]}" -eq 0 ]; then
+          echo "no assets to attach - the sealed document will be this release's only file"
+        else
+          printf '  %s\n' "${files[@]}"
+          gh release upload "$TAG" "${files[@]}" --clobber
+        fi
+
+    # ASK. The document travels as base64(gzip(its exact bytes)) over a plain urllib POST - no `gh`,
+    # for the two traps phoenix_tooling/dispatch.py records. Nothing here says which key, or which
+    # payload: the authority reads payload_id out of the document and decides from the REQUESTING
+    # REPOSITORY whether that is a line this repository may seal.
+    - name: Ask the signing authority to seal the document
+      if: steps.check.outputs.stop != '1'
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        TAG: ${{ inputs.tag }}
+        DOCUMENT: ${{ inputs.document }}
+        TRUSTED_COMMENT: ${{ steps.request.outputs.trusted_comment }}
+        PHOENIX_TOOLING_DISPATCH: ${{ inputs.dispatch-token }}
+      run: |
+        set -euo pipefail
+        python "$ACTION_PATH/phx.py" dispatch send \
+          --repo "$GITHUB_REPOSITORY" --tag "$TAG" --document "$DOCUMENT" \
+          --trusted-comment "$TRUSTED_COMMENT" \
+          --token-env PHOENIX_TOOLING_DISPATCH
+
+    # WAIT, and prove the answer is this request's - checks (a)..(d) in dispatch.py, against this
+    # action's own keys/phoenix-active.pub, the public half every client pins. stdout is the bare
+    # serial the authority assigned, which is a number this producer never chose and now learns.
+    - name: Wait for the seal, and prove it
+      id: seal
+      if: steps.check.outputs.stop != '1'
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        TAG: ${{ inputs.tag }}
+        DOCUMENT: ${{ inputs.document }}
+      run: |
+        set -euo pipefail
+        serial=$(python "$ACTION_PATH/phx.py" dispatch await \
+          --repo "$GITHUB_REPOSITORY" --tag "$TAG" --document "$DOCUMENT" \
+          --out "$RUNNER_TEMP/phx-sealed")
+        echo "serial=$serial" >> "$GITHUB_OUTPUT"
+
+    # The sealed document and its signature, which is everything a client needs that the draft does
+    # not have yet. Never the request: the serial is only in the bytes that came back.
+    - name: Attach the sealed document and its signature
+      if: steps.check.outputs.stop != '1'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        TAG: ${{ inputs.tag }}
+        DOC_NAME: ${{ steps.request.outputs.document_name }}
+      run: |
+        set -euo pipefail
+        sealed="$RUNNER_TEMP/phx-sealed"
+        gh release upload "$TAG" "$sealed/$DOC_NAME" "$sealed/$DOC_NAME.minisig" --clobber
+
+    # THE COMMIT POINT, and the reason every step above is safe to fail: until this line the release
+    # is a draft, and a failed job leaves one behind instead of a half-populated public release or
+    # one whose signature never arrived.
+    - name: Publish the release
+      if: steps.check.outputs.stop != '1'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        TAG: ${{ inputs.tag }}
+      run: gh release edit "$TAG" --draft=false
+
+    # LAST, AND NEVER FATAL. It announces a release a mirror will immediately try to fetch, so it
+    # runs after the undraft. `phx notify` already exits 0 for every mirror outcome (see its header:
+    # a mirror being down must not turn a shipped release red); what is caught here is the rest -
+    # the registry itself being unreachable. Written out rather than `continue-on-error: true`
+    # because a warning naming the cause is more use to whoever reads the run than a step that
+    # merely did not count.
+    - name: Ping the mirrors
+      id: mirrors
+      if: steps.check.outputs.stop != '1'
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        # phx notify's --token-env default, read ONLY to raise the rate limit on the public
+        # registry's latest release. Nothing else it does carries a credential.
+        GITHUB_TOKEN: ${{ inputs.token }}
+      run: |
+        set -uo pipefail
+        if python "$ACTION_PATH/phx.py" notify notify \
+             --ping-file "$RUNNER_TEMP/phx-sealed/ping.json"; then
+          echo "ok=1" >> "$GITHUB_OUTPUT"
+        else
+          echo "ok=0" >> "$GITHUB_OUTPUT"
+          echo "::warning::the mirror list could not be read, so no mirror was pinged. The release"
+          echo "::warning::is published; the ping is signed and can be delivered by anyone later."
+        fi
+
+    - name: Summary
+      if: steps.check.outputs.stop != '1'
+      shell: bash
+      env:
+        TAG: ${{ inputs.tag }}
+        PAYLOAD: ${{ steps.request.outputs.payload }}
+        SERIAL: ${{ steps.seal.outputs.serial }}
+        URL: ${{ steps.release.outputs.url }}
+        MIRRORS_OK: ${{ steps.mirrors.outputs.ok }}
+      run: |
+        {
+          echo "### Published \`$PAYLOAD\` serial \`$SERIAL\`"
+          echo
+          echo "* $URL"
+          echo "* tag \`$TAG\`, sealed by Pr0j3ctPh03nix/phoenix-release-tooling"
+          if [ "${MIRRORS_OK:-}" = "1" ]; then
+            echo "* mirrors: pinged"
+          else
+            echo "* mirrors: NOT pinged - the release is published either way"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,138 @@
+name: ci
+
+# THIS REPO'S OWN CHECKS, and the thing that makes a green `main` a release of the tooling.
+#
+# `v1` IS WHAT CONSUMERS REFERENCE (`uses: Pr0j3ctPh03nix/phoenix-release-tooling@v1`), and it MOVES:
+# `advance-v1` below re-points it at every green push to `main`. `main` is PR-protected, so every
+# merge is reviewed and every merge is a release — there is no separate "cut a version" step to
+# forget. An incompatible change to action.yml's inputs or outputs, or to the names phx.py routes
+# to, is `v2` and a note in docs/publishing.md; it is never a silent change under `v1`.
+#
+# FOR THE OPERATOR: a tag-protection ruleset that covers `v1` must list **GitHub Actions** as a
+# bypass actor, or this job cannot move the tag and every push to `main` ends red.
+#
+# WHAT IS NOT HERE: the seal itself. A dispatch spends a serial and the key exists only inside
+# seal.yml's job, so `phx rehearsal` drives that workflow's gates off GitHub instead — it is part of
+# `phx selftest`.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # BOTH RUNNER PLATFORMS, because both are producer platforms: the mod's release job runs on
+  # windows and the launcher's build does too, so `shell: bash` here is MSYS there. fail-fast is off
+  # — "it broke on windows only" is the answer, not a reason to stop asking about ubuntu.
+  selftest:
+    name: selftest (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      # Third-party actions pinned to COMMIT SHAs, not tags, the rule seal.yml states and for the
+      # same reason. The trailing comment is the human-readable version; update both together.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      # No actions/setup-python: both images ship CPython 3.12 as `python`, which is exactly what
+      # wheels/ is vendored for. An image that moves to another version fails HERE, on this repo's
+      # own CI, rather than in the signing job or in a producer's release.
+      - name: Install the two non-stdlib dependencies, from wheels/ and no index
+        shell: bash
+        run: |
+          python -m pip install --disable-pip-version-check --no-index \
+            --find-links wheels cryptography zstandard
+
+      - name: wheels/ holds the bytes SHA256SUMS records
+        shell: bash
+        run: python phx.py wheels check
+
+      - name: Every module's selftest
+        shell: bash
+        run: python phx.py selftest
+
+  # THE ONLY WAY action.yml IS EXERCISED before a producer trusts it with a release: everything a
+  # real run does past the dry run either creates a release or spends a serial. What this proves is
+  # the part that is all this repo's: the request is read, the plan is right, the assets are counted
+  # with the request document excluded, and nothing was assigned or created.
+  action-dry-run:
+    name: the action, dry (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      # staging/ holds what a producer's staging directory holds: the seal request, and one other
+      # file that is a release asset. The request lives IN the assets directory on purpose — that is
+      # the real layout, and the count below is what proves it is not attached.
+      - name: Write a fixture seal request
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          python - <<'PY'
+          import os, sys
+
+          sys.path.insert(0, os.getcwd())
+          from phoenix_tooling import build_manifest
+
+          e = build_manifest.entry("game/dota/a.bin", "a" * 64, 10, name="a.bin")
+          build_manifest.write(os.path.join("staging", "manifest.json"), "mod", "0.0.0", 0, [e])
+          with open(os.path.join("staging", "payload.phxb"), "wb") as fh:
+              fh.write(b"stands in for a bundle; a dry run attaches nothing")
+          PY
+
+      - name: Publish, dry
+        id: publish
+        uses: ./
+        with:
+          tag: v0.0.0-ci
+          document: staging/manifest.json
+          assets: staging
+          # This job's own token, and it is never used: a dry run creates nothing. It is passed
+          # because `token` is the input a real run cannot do without, and a dry run that took a
+          # different set of inputs would be rehearsing a different call.
+          token: ${{ github.token }}
+          dry-run: 'true'
+
+      - name: It planned a publish, and assigned nothing
+        shell: bash
+        env:
+          PLAN: ${{ steps.publish.outputs.plan }}
+          SERIAL: ${{ steps.publish.outputs.serial }}
+          URL: ${{ steps.publish.outputs.release-url }}
+        run: |
+          set -euo pipefail
+          echo "plan: $PLAN"
+          # The byte count is not fixed — a manifest carries `signed_at`, whose digits move — so the
+          # tag, the payload line and the asset count are what is asserted. "1 asset" is the whole
+          # point: staging/ holds two files and one of them is the request document.
+          case "$PLAN" in
+            "would publish v0.0.0-ci: payload mod, 1 assets, request of "*" bytes") ;;
+            *) echo "the action planned something else, or nothing at all"; exit 1 ;;
+          esac
+          test -z "$SERIAL" || { echo "a dry run was assigned serial $SERIAL"; exit 1; }
+          test -z "$URL" || { echo "a dry run created $URL"; exit 1; }
+
+  # The release of this repository. Nothing else advances `v1`, and it advances only on `main`.
+  advance-v1:
+    if: github.event_name == 'push'
+    needs: [selftest, action-dry-run]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Move v1 to this commit
+        run: |
+          set -euo pipefail
+          git tag -f v1
+          git push -f origin v1
+          echo "v1 -> $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
