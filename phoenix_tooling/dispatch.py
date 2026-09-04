@@ -639,7 +639,11 @@ def _read_text(path):
 def main(argv=None):
     # Everything this says goes to stderr except `await`'s last line; both streams carry a tag and a
     # repo name on a box whose default encoding is not UTF-8.
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    #
+    # newline="\n" on STDOUT only, and it is not cosmetic: Windows text mode writes CRLF, `$(...)`
+    # strips the trailing LF and leaves the CR, and the serial a workflow captured is then a number
+    # with an invisible character on the end of it. stderr is read by people, where CRLF is fine.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace", newline="\n")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
     ap = argparse.ArgumentParser(prog="phx dispatch", description=__doc__.splitlines()[0])

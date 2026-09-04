@@ -529,7 +529,11 @@ def _read_text(path):
 
 
 def main(argv=None):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    # newline="\n" on STDOUT, for the two things that go there: `ledger`'s bare number, which a
+    # workflow captures with $(...) -- Windows text mode would leave the CR on the end of it, since
+    # command substitution strips only the LF -- and `sign` without --out, whose bytes are a ping
+    # document that must be the same on every platform. stderr is read by people.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace", newline="\n")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
     ap = argparse.ArgumentParser(prog="phx ping", description=__doc__.splitlines()[0])
