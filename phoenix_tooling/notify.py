@@ -107,7 +107,7 @@ class NotifyError(Exception):
 
 
 def die(msg) -> NoReturn:
-    sys.exit("notify-mirrors: " + msg)
+    sys.exit("notify: " + msg)
 
 
 # --- the list -------------------------------------------------------------------------------------
@@ -266,14 +266,14 @@ def report(results, payload, skipped):
     bad = sum(not r.ok for r in results)
     tail = "" if not skipped else ", {} carry no {}".format(skipped, payload)
     if not results:
-        print("notify-mirrors: no published mirror carries {} — nothing to ping{}"
+        print("notify: no published mirror carries {} — nothing to ping{}"
               .format(payload, tail), file=sys.stderr)
     elif bad:
-        print("notify-mirrors: {} mirror(s) carry {}, {} pinged, {} FAILED — the release is "
+        print("notify: {} mirror(s) carry {}, {} pinged, {} FAILED — the release is "
               "published either way{}".format(len(results), payload, len(results) - bad, bad, tail),
               file=sys.stderr)
     else:
-        print("notify-mirrors: {} mirror(s) carry {}, all pinged{}"
+        print("notify: {} mirror(s) carry {}, all pinged{}"
               .format(len(results), payload, tail), file=sys.stderr)
     return bad
 
@@ -609,7 +609,7 @@ def main(argv=None):
         die(str(e))
 
     carrying = [m for m in mirrors if payload in m.payloads]
-    print("notify-mirrors: {} — list serial {}, {} mirror(s); pinging {} for {} serial {}".format(
+    print("notify: {} — list serial {}, {} mirror(s); pinging {} for {} serial {}".format(
         a.list_path or a.registry, doc.get("serial", "?"), len(mirrors), len(carrying),
         payload, pdoc["serial"]), file=sys.stderr)
     bad = report(notify(mirrors, payload, body, a.retries, a.timeout),

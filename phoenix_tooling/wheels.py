@@ -41,10 +41,10 @@ def wheel_files():
     vacuously true of a listing of nothing, and the answer a reader wants is "the install set is
     there and intact"."""
     if not os.path.isdir(WHEELS):
-        sys.exit("wheels_check: no such directory: {}".format(WHEELS))
+        sys.exit("wheels: no such directory: {}".format(WHEELS))
     names = sorted(n for n in os.listdir(WHEELS) if n.endswith(".whl"))
     if not names:
-        sys.exit("wheels_check: {} holds no wheels".format(WHEELS))
+        sys.exit("wheels: {} holds no wheels".format(WHEELS))
     return names
 
 
@@ -58,7 +58,7 @@ def sha256(name):
 
 def read_sums():
     if not os.path.isfile(SUMS):
-        sys.exit("wheels_check: no {} — run `wheels_check.py write`".format(SUMS))
+        sys.exit("wheels: no {} — run `phx wheels write`".format(SUMS))
     out = {}
     with open(SUMS, encoding="utf-8") as fh:
         for n, line in enumerate(fh, 1):
@@ -67,7 +67,7 @@ def read_sums():
                 continue
             digest, _, name = line.partition("  ")
             if len(digest) != 64 or not name:
-                sys.exit("wheels_check: {}:{}: not a '<sha256>  <name>' line".format(SUMS, n))
+                sys.exit("wheels: {}:{}: not a '<sha256>  <name>' line".format(SUMS, n))
             out[name] = digest
     return out
 
@@ -87,7 +87,7 @@ def pypi_files(project, version, cache):
             with urllib.request.urlopen(url, timeout=60) as r:
                 data = json.load(r)
         except Exception as e:                          # noqa: BLE001 — any failure is "unconfirmed"
-            sys.exit("wheels_check: cannot read {}: {}".format(url, e))
+            sys.exit("wheels: cannot read {}: {}".format(url, e))
         cache[key] = {u["filename"]: (u["digests"]["sha256"], u["size"]) for u in data["urls"]}
     return cache[key]
 
@@ -109,8 +109,8 @@ def check():
             print("  FAIL {}\n         recorded {}\n         on disk  {}".format(
                 name, listed[name], got))
         bad += 1
-    print("wheels_check: {} wheels, all match SHA256SUMS".format(len(present)) if not bad
-          else "wheels_check: {} of {} FAILED".format(bad, len(set(listed) | set(present))))
+    print("wheels: {} wheels, all match SHA256SUMS".format(len(present)) if not bad
+          else "wheels: {} of {} FAILED".format(bad, len(set(listed) | set(present))))
     return bad
 
 
@@ -139,12 +139,12 @@ def write():
         print("  ok   {}  {}".format(name, got))
         rows.append((name, got))
     if bad:
-        print("wheels_check: {} of {} unconfirmed — SHA256SUMS NOT written".format(bad, len(names)))
+        print("wheels: {} of {} unconfirmed — SHA256SUMS NOT written".format(bad, len(names)))
         return bad
     with open(SUMS, "w", encoding="utf-8", newline="\n") as fh:
         for name, digest in rows:
             fh.write("{}  {}\n".format(digest, name))
-    print("wheels_check: {} wheels confirmed against PyPI -> {}".format(len(rows), SUMS))
+    print("wheels: {} wheels confirmed against PyPI -> {}".format(len(rows), SUMS))
     return 0
 
 

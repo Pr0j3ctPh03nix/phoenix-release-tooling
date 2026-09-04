@@ -444,7 +444,7 @@ def main(argv=None):
         try:
             sys.exit(1 if _selftest() else 0)
         except RehearsalError as e:
-            sys.exit(f"seal-rehearsal: {e}")
+            sys.exit(f"rehearsal: {e}")
     sys.exit("usage: phx rehearsal selftest")
 
 

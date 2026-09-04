@@ -75,8 +75,9 @@ def seal(manifest_path, pub_path, trusted_comment, secret_text, sig_path=None):
     # 2. and prove it, against the half that ships
     if not os.path.isfile(pub_path):
         die("no such public key: {}\n"
-            "  It is synced from the dev superset (sync.py DEV_TOOLS). A checkout without it means "
-            "the superset was not synced before this release.".format(pub_path))
+            "  The published halves live in this repository's keys/, which is a promised stable "
+            "path — pass keys/phoenix-active.pub from the checkout that is sealing.".format(
+                pub_path))
     with open(pub_path, encoding="utf-8", newline="") as fh:
         pub = fh.read()
     try:
