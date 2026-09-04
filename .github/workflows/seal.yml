@@ -37,7 +37,8 @@ name: seal
 # minted for every kind, including one no mirror will ever be told about; see the sealing step for
 # why the entries are uniform.
 #
-# What a producer must do around this is docs/sealing.md. Read that before changing anything below.
+# What a producer does around this is action.yml, and the contract it implements is
+# docs/publishing.md. Read that before changing anything below.
 #
 # EVERY GATE RUNS BEFORE THE KEY IS READ, and the order is the whole design:
 #   0. THE REF               — this file signs only on `main`, checked first and before anything
@@ -326,7 +327,7 @@ jobs:
           # what that producer thinks it built.
           if serial != 0:
               refuse(f"this document carries serial {serial}, and a seal request carries 0 — the "
-                     f"authority assigns serials from its ledger. See docs/sealing.md.")
+                     f"authority assigns serials from its ledger. See docs/publishing.md.")
 
           # The request's bytes, under a name that is NOT the document's: what gets sealed is what
           # the next step writes there, at the serial it assigns.

@@ -16,8 +16,8 @@ back, not the one it sent. Every producer used to run the same `max(ledger, publ
 itself; three copies of an arithmetic whose only correct answer lives in one place is three chances
 to be wrong about it.
 
-WHAT `await` PROVES, in this order, all against the PINNED CHECKOUT's own keys/phoenix-active.pub
--- the same public half every client pins:
+WHAT `await` PROVES, in this order, all against THIS CHECKOUT's own keys/phoenix-active.pub -- the
+same public half every client pins, and whichever reference of this repo the producer reached:
 
   (a) the signature covers the document's exact bytes;
   (b) the ping is signed by that same key;
@@ -132,7 +132,7 @@ def read_request(path):
     serial = doc.get("serial")
     if isinstance(serial, bool) or serial != 0:
         raise DispatchError(f"{path} carries serial {serial!r}, and a seal request carries 0. The "
-                            "authority assigns serials from its ledger -- see docs/sealing.md.")
+                            "authority assigns serials from its ledger -- see docs/publishing.md.")
     return raw, doc, payload
 
 

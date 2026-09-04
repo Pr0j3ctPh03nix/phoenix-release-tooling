@@ -7,12 +7,14 @@
 
 ONE copy, because there are three producers and a mirror must not hear about a release three
 different ways: the mod in dist's CI, the launcher in its own, the base game by hand. Each already
-checks this repo out at a pinned commit SHA, so the delivery arrives by the same pin as everything
-else it reads from here — and the one thing every producer does after publishing is written once.
+reaches this repo at one reference — the CI producers through action.yml, which runs this as the last
+step of a publish; the base game through a checkout — so the delivery arrives the same way as
+everything else read from here, and the one thing every producer does after publishing is written
+once.
 
 WHO MINTS THE PING is not this script and not the producer: it is the signing authority, in the same
 job that sealed the manifest (.github/workflows/seal.yml), and a producer fetches it from branch
-`sealed` beside the signature — see docs/sealing.md. The by-hand base game is the exception that
+`sealed` beside the signature — see docs/publishing.md. The by-hand base game is the exception that
 proves it: whoever holds the key mints its ping with `phx ping sign --sec`, because
 they are the authority that day.
 

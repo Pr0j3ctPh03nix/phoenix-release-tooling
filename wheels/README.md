@@ -6,13 +6,13 @@ vendored as wheels so a producer installs them with
 
     python -m pip install --disable-pip-version-check --no-index --find-links <checkout>/wheels cryptography [zstandard]
 
-and reaches no index at all. Every producer already checks this repo out at a pinned commit SHA to
-seal with, so the wheels arrive by the same pin as the signer they feed.
+and reaches no index at all. Every producer already reaches this repo at one pinned reference to
+publish with, so the wheels arrive by the same pin as the signer they feed.
 
 WHY, in one line: the job doing that install is the job that holds `PHOENIX_SIGNING_KEY`, and these
-wheels are the code the key is handed to. The argument is written out on the install step of each
-producer's workflow — `client-dist-staging` and `phoenix-launcher`'s `.github/workflows/release.yml`,
-`phoenix-mirror-registry`'s `.github/workflows/publish.yml` — and not restated here. What this
+wheels are the code the key is handed to. The argument is written out on the two install steps that
+use this directory — `../action.yml`'s first step, which a producer runs, and
+`../.github/workflows/seal.yml`'s, which the key-holding job runs — and not restated here. What this
 directory buys is that after that step, the key-holding job's inputs are two git checkouts at pinned
 commit SHAs and nothing else.
 

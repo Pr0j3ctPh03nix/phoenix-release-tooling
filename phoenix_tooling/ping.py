@@ -323,7 +323,7 @@ def ledger_high(path, payload):
     return, and skipping it silently lowers the high-water mark. What the ledger is NOT is
     self-authenticating -- nothing here checks the ping signatures it reads (that would need the
     signer, and this must stay stdlib-only). Its integrity is a property of who may push to the
-    `sealed` branch; see docs/sealing.md."""
+    `sealed` branch; see docs/publishing.md."""
     check_payload(payload)
     high = 0
     for rel, doc in ledger_entries(ledger_root(path)):
