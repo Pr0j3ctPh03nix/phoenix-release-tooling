@@ -2,7 +2,7 @@
 
 The one thing every Phoenix producer shares — the mod, the launcher, the base game, the mirror
 registry: the **manifest format**, the **signer**, the **signing authority** that holds the release
-key, and the **mirror ping**. It belongs to none of them, so it is its own repository. GPL-3.0.
+key, and the **mirror ping**. It belongs to none of them, so it is its own repository.
 
 A producer builds its payload, then does one step:
 
