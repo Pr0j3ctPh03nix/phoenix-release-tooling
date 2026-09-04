@@ -419,8 +419,11 @@ jobs:
       # producer's workflow uses (see wheels/README.md). This job holds PHOENIX_SIGNING_KEY and
       # `cryptography` is the code the key is handed to, so it arrives from this repository's own
       # tree rather than from whatever an index answers with at signing time. Installed only after
-      # every gate above has passed: a refused request never installs anything.
+      # every gate above has passed: a refused request never installs anything. Skipped on the
+      # same condition as the two steps below, for the same reason: a re-dispatch of a request that
+      # is already sealed signs nothing, so it has nothing to install the signer for.
       - name: Install the signing dependency
+        if: steps.assign.outputs.already_sealed != '1'
         run: python -m pip install --disable-pip-version-check --no-index --find-links wheels cryptography
 
       # Sign the document's exact bytes and prove the signature against the public half clients
