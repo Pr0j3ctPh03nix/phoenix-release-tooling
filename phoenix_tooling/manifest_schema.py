@@ -371,6 +371,14 @@ MANIFEST = Obj(
     # nothing real -- a run counter reset by a renamed workflow yields 2000001, which clears the
     # floor and still lands below every installed client's ratchet, so the release is invisible to
     # everyone who already has one -- while making this module know a thing about a producer's CI.
+    #
+    # 0 IS THE SEAL REQUEST, and needs nothing from the format to say so: no consumer will ever
+    # accept it as a release (ping.check_serial refuses it, and so do the mirror app and the base
+    # game builder), so a document carrying 0 already means "names no release". That is exactly
+    # what a producer sends to the signing authority, which assigns the real number and re-renders
+    # the document -- see build_manifest.assign. Min 0 rather than an absent key: a request is a
+    # legal document, validate() reads one unchanged, and no reader has to have an opinion about a
+    # missing field.
     serial=Int(min=0),
     # Reads whatever build_manifest.py put on `owner.signed_at` -- None by default (build() alone
     # never touches the clock), the real timestamp once write() supplies one. ABSENT while it is

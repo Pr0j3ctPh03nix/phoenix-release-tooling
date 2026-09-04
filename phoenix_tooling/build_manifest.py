@@ -18,7 +18,7 @@ hand-typed there.
     entries = [pak := entry("game/dota/pak01_000.vpk", sha1, size1, name="pak01_000.vpk"),
                npc := entry("game/dota/scripts/npc/npc_units.txt", sha2, size2)]   # bundled: no name
     bundle = Bundle("b000-txt-4f3a91c2.phxb", "zstd", psize, psha, entries=[npc])
-    doc = build("mod", "1.0.0", 2_000_007, entries, bundles=[bundle])
+    doc = build("mod", "1.0.0", entries=entries, bundles=[bundle])   # serial 0: a SEAL REQUEST
 
 Structural consequences worth spelling out, because each one replaces a rule
 validate_manifest.py used to check AFTER the fact:
@@ -365,9 +365,18 @@ def _check_tree(tree, entry_ids):
 
 # --- the public API ---------------------------------------------------------------------------
 
-def build(payload_id, version, serial, entries, bundles=(), options=(), tree=None, notes=None,
+def build(payload_id, version, serial=0, entries=(), bundles=(), options=(), tree=None, notes=None,
           signed_at=None):
     """-> a manifest dict.
+
+    `serial` defaults to 0, which is a SEAL REQUEST: the document names no release, and the signing
+    authority assigns the real number (see `assign`). A producer that fills one in itself is a
+    producer that has to know the ledger -- which is the whole thing that moved.
+
+    `entries` carries a default only so that `serial` can: the three producers pass both
+    positionally, so moving `entries` ahead of `serial` would be a breaking change in three
+    repositories to save this line. An empty files[] is refused by the format a few lines below,
+    which is where it should be refused anyway.
 
     `entries` become `files[]`. `bundles`/`options`/`tree` are omitted from the document entirely
     when empty -- the shape every existing producer already used for "this release has none".
@@ -410,8 +419,22 @@ def build(payload_id, version, serial, entries, bundles=(), options=(), tree=Non
     return _render_obj(schema.MANIFEST, doc)
 
 
-def write(path, payload_id, version, serial, entries, bundles=(), options=(), tree=None, notes=None):
+def render(doc):
+    """A manifest dict -> the document's exact bytes. THE canonical serialization, and the only one.
+
+    A signature covers bytes, so this has to be a single definition: the authority signs
+    `render(assign(request, serial))` and the producer proves the document it got back is that same
+    thing by rendering it again itself. Two spellings of "the same JSON" would make that comparison
+    a coin toss, and the disagreement would only ever surface as a signature nobody can verify."""
+    return json.dumps(doc, indent=2, ensure_ascii=False).encode("utf-8") + b"\n"
+
+
+def write(path, payload_id, version, serial=0, entries=(), bundles=(), options=(), tree=None,
+          notes=None):
     """build() with the wall clock filled in for `signed_at`, then write the result to `path`.
+
+    `serial` defaults to 0 for the reason build() does: what this writes is a SEAL REQUEST unless
+    the caller is the authority itself.
 
     `signed_at` is ADVISORY (docs/manifest-reader-contract.md, back when docs/ existed) and is the
     one field genuinely tied to the moment of writing rather than to the release's content -- which
@@ -422,9 +445,8 @@ def write(path, payload_id, version, serial, entries, bundles=(), options=(), tr
     out_dir = os.path.dirname(os.path.abspath(path))
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="\n") as fh:
-        json.dump(doc, fh, indent=2, ensure_ascii=False)
-        fh.write("\n")
+    with open(path, "wb") as fh:
+        fh.write(render(doc))
     return doc
 
 
@@ -616,9 +638,9 @@ def validate(doc):
     treat EITHER as "do not sign this". What it proves is narrow and worth stating: the document is
     a legal manifest that a builder could have written, its derived fields really follow from its
     contents, and it carries nothing else. It says nothing about whether the hashes name real
-    bytes, nor whether the serial is the right one -- that second question is the ledger's (see
-    phoenix_tooling/ping.py's ledger_high), and it is the reason the authority reads `serial` from
-    the document rather than from whoever asked for a signature."""
+    bytes, nor about which serial the document ought to carry -- that second question is the
+    ledger's (see phoenix_tooling/ping.py's ledger_high) and is answered by the authority, in
+    `assign` below, after this has passed."""
     rebuilt = build(**load(doc))
     # `signed_at` is the ONE field a rebuild cannot re-derive: manifest_schema declares it Derived
     # from an attribute the builder is handed (the clock is not this format's to read), so whatever
@@ -635,12 +657,41 @@ def validate(doc):
     return rebuilt
 
 
+def assign(doc, serial):
+    """A seal request (serial 0) + the serial the authority picked -> the document to sign.
+
+    THE ONE PLACE A SERIAL IS WRITTEN INTO A DOCUMENT that was not built with one, and it runs on
+    BOTH sides of the boundary: the authority renders this and signs it, the producer renders it
+    again and requires the bytes it fetched back to be identical. That is what proves the signature
+    covers the document this producer built, rather than an earlier attempt's under the same tag --
+    a comparison, not a judgement, which is why there must be exactly one function doing it.
+
+    The result goes through validate(), so it is a document this builder produces from its own
+    contents; and being validate()'s own rebuild, it comes back in the format's key order whatever
+    order the request arrived in.
+
+    `serial` is checked by ping.check_serial -- >= 1, within the u64, never a bool -- because that
+    is already the rule the ping and the ledger enforce, and a second one here would eventually
+    disagree with it."""
+    from . import ping     # local: this module is the format, and the format does not need a ping
+
+    current = _get(doc, "serial", "the manifest")
+    if isinstance(current, bool) or current != 0:
+        raise ValueError(f"the authority assigns serials; a request carries serial 0, and this "
+                         f"document carries {current!r}")
+    try:
+        assigned = int(ping.check_serial(serial))
+    except ping.PingError as e:
+        raise ValueError(f"{e} -- a seal assigns the serial a release is published at") from None
+    return validate(dict(doc, serial=assigned))
+
+
 # --- selftest -----------------------------------------------------------------------------------
 
 # A serial for every case where the NUMBER itself is beside the point. The format's only rule about
-# one is Int(min=0); which value a real release carries is each producer's own decision, made where
-# it publishes. Shaped like a real one so a failure message reads like a real document rather than
-# a toy.
+# one is Int(min=0); which value a real release carries is the signing authority's decision, made
+# from the ledger at the moment it seals. Shaped like a real one so a failure message reads like a
+# real document rather than a toy.
 _TEST_SERIAL = 2_000_001
 
 
@@ -1201,14 +1252,11 @@ def _selftest():
         return build("mod", "1.0.0", _TEST_SERIAL, [pak, npc], bundles=[bun], options=[opt],
                      tree=[Node(label="Phoenix Core", files=[pak, npc])], notes="what changed")
 
-    def wire(doc):
-        """The bytes a producer uploads and this authority is asked to sign."""
-        return json.dumps(doc, indent=2, ensure_ascii=False).encode("utf-8") + b"\n"
-
     def as_sent(**tweaks):
+        """The bytes a producer uploads and this authority is asked to sign, read back."""
         doc = sample()
         doc.update(tweaks)
-        return validate(parse(wire(doc)))
+        return validate(parse(render(doc)))
 
     ok("a full document round-trips: parse -> validate returns it unchanged",
        lambda: assert_(as_sent() == sample(), "the rebuilt document differs from the original"))
@@ -1254,12 +1302,12 @@ def _selftest():
         doc = sample()
         doc["files"][0]["dest"] = "../evil.dll"
         doc["tree"][0]["files"][0] = "../evil.dll"
-        validate(parse(wire(doc)))
+        validate(parse(render(doc)))
 
     def an_entry_carrying_its_own_key():
         doc = sample()
         doc["files"][0]["url"] = "http://mirror.example/pak01_000.vpk"
-        validate(parse(wire(doc)))
+        validate(parse(render(doc)))
 
     refused("a traversing dest, on the wire", traversing_dest_on_the_wire)
     refused("a tree node pointing at a dest that is not in files[]",
@@ -1275,8 +1323,61 @@ def _selftest():
     refused("a root that is not an object", lambda: parse(b'["mod", 1]'))
     refused("bytes that are not UTF-8", lambda: parse(b'{"version":"\xff\xfe"}'))
     refused("JSON with something appended after it",
-            lambda: parse(wire(sample()) + b'{"serial":9}'))
+            lambda: parse(render(sample()) + b'{"serial":9}'))
     refused("bytes that are not JSON at all", lambda: parse(b"winmm.dll"))
+
+    # --- the seal request: ONE serialization, and ONE place a serial is written ------------------
+    # Both sides of the signing boundary run this code over the same request, so every case here is
+    # really about whether they can disagree.
+
+    def request():
+        e = entry("game/dota/a.bin", sha("a"), 10, name="a.bin")
+        return build("mod", "1.0.0", entries=[e])
+
+    def build_defaults_to_a_request():
+        assert_(request()["serial"] == 0, "build() must default to a seal request")
+
+    def write_renders():
+        import tempfile
+        e = entry("game/dota/a.bin", sha("a"), 10, name="a.bin")
+        path = os.path.join(tempfile.mkdtemp(), "manifest.json")
+        doc = write(path, "mod", "1.0.0", entries=[e])
+        with open(path, "rb") as fh:
+            on_disk = fh.read()
+        assert_(on_disk == render(doc), "write() puts something other than render() on disk")
+        assert_(doc["serial"] == 0, "write() must default to a seal request too")
+
+    def assign_writes_the_serial_and_nothing_else():
+        req = request()
+        sealed = assign(req, 2_000_042)
+        assert_(sealed["serial"] == 2_000_042, f"serial is {sealed['serial']}")
+        assert_(validate(sealed) == sealed, "the assigned document does not validate")
+        assert_(dict(sealed, serial=0) == req, "assign() changed something other than the serial")
+        # The bytes are what is signed, so the byte-level statement is the one worth making.
+        assert_(render(sealed) != render(req), "the rendered bytes did not change at all")
+
+    def a_serial_as_text_assigns_the_same_document():
+        # ping.check_serial takes both, deliberately: the authority reads its number out of an env
+        # var and a caller in Python has an int. They must land on one document.
+        assert_(assign(request(), "2000042") == assign(request(), 2_000_042), "text and int differ")
+
+    ok("build() with no serial is a seal request", build_defaults_to_a_request)
+    ok("write() puts exactly render()'s bytes on disk", write_renders)
+    ok("assign() sets the serial and leaves every other byte alone",
+       assign_writes_the_serial_and_nothing_else)
+    ok("a serial given as decimal text assigns the same document as the int",
+       a_serial_as_text_assigns_the_same_document)
+
+    refused("assigning to a document that already names a release",
+            lambda: assign(assign(request(), 7), 8))
+    refused("a document with no serial at all", lambda: assign({"payload_id": "mod"}, 7))
+    refused("serial 0 as the assignment -- it names no release", lambda: assign(request(), 0))
+    refused("a negative serial as the assignment", lambda: assign(request(), -1))
+    refused("a serial above the u64 as the assignment",
+            lambda: assign(request(), schema.U64_MAX + 1))
+    refused("`True` as the assignment", lambda: assign(request(), True))
+    refused("assigning to a document this builder would not build",
+            lambda: assign(dict(request(), remove=["game/dota/old.txt"]), 7))
 
     for good, name, detail in results:
         print(f"  {'ok  ' if good else 'FAIL'} {name}" + (f"\n         {detail}" if detail else ""))
@@ -1301,8 +1402,12 @@ def main(argv=None):
             doc = validate(parse(raw))
         except (ValueError, TypeError) as e:
             sys.exit(f"REFUSED {argv[1]}\n  {e}")
+        # A document at serial 0 is not half-written: it is what a producer sends the authority, and
+        # saying so here is what stops "serial 0" reading as a bug at the one moment it is checked.
+        serial = ("serial 0 (a seal request)" if doc["serial"] == 0
+                  else f"serial {doc['serial']}")
         print(f"ok {argv[1]} — schema {doc['schema']}, payload {doc['payload_id']}, "
-              f"serial {doc['serial']}, {len(doc['files'])} file(s)")
+              f"{serial}, {len(doc['files'])} file(s)")
         return
     sys.exit("usage: phx manifest selftest | validate <manifest.json>")
 
