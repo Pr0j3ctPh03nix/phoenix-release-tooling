@@ -11,9 +11,10 @@ A PRODUCER KNOWS NOTHING ABOUT SERIALS. It builds a document at serial 0 -- whic
 because nothing anywhere accepts one at 0 -- and sends it. The authority
 (.github/workflows/seal.yml) assigns the number one above its ledger, writes it into the document,
 signs THOSE bytes, and commits document + signature + ping to branch `sealed`. `await` fetches all
-three and publishes the document that came back, not the one it sent. Every producer used to run the
-same `max(ledger, published) + 1` rule for itself; three copies of an arithmetic whose only correct
-answer lives in one place is three chances to be wrong about it.
+three, prints the assigned serial as a BARE number on stdout, and publishes the document that came
+back, not the one it sent. Every producer used to run the same `max(ledger, published) + 1` rule for
+itself; three copies of an arithmetic whose only correct answer lives in one place is three chances
+to be wrong about it.
 
 WHAT `await` PROVES, in this order, all against the PINNED CHECKOUT's own keys/phoenix-active.pub
 -- the same public half every client pins:
@@ -524,8 +525,8 @@ def _selftest():
         # --- await: the answer arrives ------------------------------------------------------
         good = commit(ledger_repo("good"), answer(req, 2_000_043))
         (code, out, err), out_dir = waited("--authority", url_of(good), "--timeout", "0")
-        ok("a sealed entry passes every check, and the serial is the last thing on stdout",
-           lambda: assert_(code == 0 and out.strip().splitlines()[-1] == "serial 2000043",
+        ok("a sealed entry passes every check, and stdout is the bare serial and nothing else",
+           lambda: assert_(code == 0 and out.strip() == "2000043",
                            f"exit {code}, stdout {out!r}, stderr {err}"))
         ok("...and the three files are written as fetched, byte for byte",
            lambda: assert_(all(raw(os.path.join(out_dir, n)) == b
@@ -546,7 +547,7 @@ def _selftest():
         finally:
             appears.cancel()
         ok("an entry committed while the loop is waiting is picked up by a later poll",
-           lambda: assert_(code == 0 and out.strip().endswith("serial 5"),
+           lambda: assert_(code == 0 and out.strip() == "5",
                            f"exit {code}, stdout {out!r}, stderr {err}"))
 
         # --- await: answers that are genuinely signed and still not ours ---------------------
@@ -612,7 +613,7 @@ def _selftest():
                              "--document", mirrors_req, "--out", os.path.join(tmp, "out-mirrors"),
                              "--pub", pub_path, "--authority", url_of(mirrors_led), "--timeout", "0")
         ok("a mirror list is fetched and proven under its own document name",
-           lambda: assert_(code == 0 and out.strip().endswith("serial 3")
+           lambda: assert_(code == 0 and out.strip() == "3"
                            and os.path.isfile(os.path.join(tmp, "out-mirrors", "mirrors.json")),
                            f"exit {code}, stdout {out!r}, stderr {err}"))
     finally:
@@ -709,8 +710,10 @@ def main(argv=None):
         write_answer(files, a.out)
         print(f"dispatch: {a.repo} {a.tag} is sealed at serial {serial}; "
               f"{', '.join(sorted(files))} -> {a.out}", file=sys.stderr)
-        # The one line on stdout, last: a workflow captures it to learn the number it never chose.
-        print(f"serial {serial}")
+        # The one line on stdout, last, and BARE: a workflow captures it whole
+        # (`SERIAL=$(phx dispatch await ...)`), exactly as it captures `phx ping ledger`. A prefix
+        # here would be a word every caller has to cut off again, and one of them would forget.
+        print(serial)
     except (DispatchError, OSError) as e:
         die(str(e))
 
