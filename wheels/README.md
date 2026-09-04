@@ -6,8 +6,8 @@ vendored as wheels so a producer installs them with
 
     python -m pip install --disable-pip-version-check --no-index --find-links <checkout>/wheels cryptography [zstandard]
 
-and reaches no index at all. Every producer already reaches this repo at one pinned reference to
-publish with, so the wheels arrive by the same pin as the signer they feed.
+and reaches no index at all. Every producer already reaches this repo at one reference (`@v1`) to
+publish with, so the wheels arrive by the same reference as the verifier they feed.
 
 WHY, in one line: the job doing that install is the job that holds `PHOENIX_SIGNING_KEY`, and these
 wheels are the code the key is handed to. The argument is written out on the two install steps that
