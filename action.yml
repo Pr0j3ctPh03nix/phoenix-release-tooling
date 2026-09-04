@@ -147,8 +147,12 @@ runs:
         def fail(why):
             sys.exit("phoenix publish: " + why)
 
-        tag = os.environ["TAG"].strip()
-        doc_path = os.environ["DOCUMENT"].strip()
+        # .get, not [..]: an input left at its empty default may reach the step as an unset
+        # variable, and "there is no tag" deserves the message below rather than a KeyError.
+        def arg(name):
+            return os.environ.get(name, "").strip()
+
+        tag, doc_path = arg("TAG"), arg("DOCUMENT")
         # `required: true` on an input is advisory - the runner does not enforce it - so the two
         # things without which there is nothing to do are checked here.
         if not tag:
@@ -171,7 +175,7 @@ runs:
         if not isinstance(payload, str) or not payload:
             fail(doc_path + " names no payload_id, so there is nothing to publish it as.")
 
-        comment = os.environ["TRUSTED_COMMENT"].strip() or ("phoenix %s %s" % (payload, tag))
+        comment = arg("TRUSTED_COMMENT") or ("phoenix %s %s" % (payload, tag))
         # GITHUB_OUTPUT is line-based, so a newline here would be an injected output rather than a
         # refusal. The rest of the rule - printable ASCII, 200 characters - is the authority's, and
         # is checked there.
@@ -181,7 +185,7 @@ runs:
         # Top level only, regular files only: `assets` names a directory of finished files to
         # attach, not a tree to walk. The request document is skipped wherever in it it sits -
         # what gets attached is the SEALED document, after the seal comes back.
-        assets, files = os.environ["ASSETS"].strip(), []
+        assets, files = arg("ASSETS"), []
         if assets:
             if not os.path.isdir(assets):
                 fail("no such assets directory: " + assets)
