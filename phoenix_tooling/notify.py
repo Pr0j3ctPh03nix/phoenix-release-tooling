@@ -13,7 +13,7 @@ else it reads from here — and the one thing every producer does after publishi
 WHO MINTS THE PING is not this script and not the producer: it is the signing authority, in the same
 job that sealed the manifest (.github/workflows/seal.yml), and a producer fetches it from branch
 `sealed` beside the signature — see docs/sealing.md. The by-hand base game is the exception that
-proves it: whoever holds the key mints its ping with `phoenix_tooling/ping.py sign --sec`, because
+proves it: whoever holds the key mints its ping with `phx ping sign --sec`, because
 they are the authority that day.
 
 WHAT IS DELIVERED is the SIGNED ping document phoenix_tooling/ping.py minted at the moment the

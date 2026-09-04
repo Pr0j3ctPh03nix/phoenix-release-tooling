@@ -34,8 +34,7 @@ straight from the environment, so there is no keyfile to leak between the write 
 no `trap` to get wrong. `--sec` is for the by-hand game build, where the key is a file on an
 offline machine and that is the whole point.
 
-Stdlib plus `cryptography` (through minisign), so it ships to dist via sync.py's DEV_TOOLS
-and every CI reads exactly one copy of it.
+Stdlib plus `cryptography` (through minisign).
 """
 import argparse
 import os
