@@ -13,22 +13,31 @@ name: seal
 #                 "manifest": "<base64(gzip(the exact document bytes))>",
 #                 "trusted_comment": "phoenix mod v1.2.3"}}
 #
-# `manifest` is that field's name whatever KIND of document it carries — a payload manifest or the
-# mirror list — for the same reason phoenix_tooling/seal.py's flag is called `--manifest`: what
-# gets signed is a FILE's exact bytes, and the signer reads nothing inside them.
+# The document is a SEAL REQUEST: it carries `serial: 0`, which names no release (nothing anywhere
+# accepts a release at 0), and this job assigns the real number. A producer therefore knows nothing
+# about serials — it does not read the ledger, does not count, and cannot propose a number that is
+# already spent. `manifest` is that field's name whatever KIND of document it carries — a payload
+# manifest or the mirror list — for the same reason phoenix_tooling/seal.py's flag is called
+# `--manifest`: what gets signed is a FILE's exact bytes, and the signer reads nothing inside them.
 #
 # THE ANSWER, on branch `sealed`, which anybody may read:
 #
-#     sealed/<owner>/<name>/<tag>/<document>.minisig   the signature over those exact bytes
-#     sealed/<owner>/<name>/<tag>/ping.json            the signed mirror ping for that serial
+#     sealed/<owner>/<name>/<tag>/<document>          the document AS SEALED, serial assigned
+#     sealed/<owner>/<name>/<tag>/<document>.minisig  the signature over those exact bytes
+#     sealed/<owner>/<name>/<tag>/ping.json           the signed mirror ping for that serial
+#
+# The document itself is part of the answer because this job is what wrote the serial into it: the
+# producer publishes what comes back, not what it sent. It proves the three belong to it by
+# re-rendering its own request at the ping's serial and requiring the bytes to match — see
+# phoenix_tooling/dispatch.py, which is both halves of the producer's side.
 #
 # <document> is the file that was sealed — `manifest.json` for a payload manifest, `mirrors.json`
-# for the mirror list — so a signature in the ledger is never separable from what it covers. The
-# ping is minted for every kind, including one no mirror will ever be told about; see the sealing
-# step for why the entries are uniform.
+# for the mirror list (phoenix_tooling/ping.py's `document_name` owns that rule, because both
+# sides need it) — so a signature in the ledger is never separable from what it covers. The ping is
+# minted for every kind, including one no mirror will ever be told about; see the sealing step for
+# why the entries are uniform.
 #
-# What a producer must do around this — and the fact that its fetch loop still succeeds when a
-# re-run is refused here — is docs/sealing.md. Read that before changing anything below.
+# What a producer must do around this is docs/sealing.md. Read that before changing anything below.
 #
 # EVERY GATE RUNS BEFORE THE KEY IS READ, and the order is the whole design:
 #   0. THE REF               — this file signs only on `main`, checked first and before anything
@@ -37,14 +46,15 @@ name: seal
 #   1. decode and authorize   — a repo may only seal the payload line it is listed for, below;
 #   2. VALIDATE the document  — a manifest is rebuilt by phoenix_tooling/build_manifest.py and
 #      the result must equal what was sent; a mirror list is held to its own narrow rules (see
-#      `read_mirrors`).
+#      `read_mirrors`). Both must carry serial 0: a request that names a release is a producer
+#      trying to choose one, which is the thing that moved here.
 #      Without this the job is an oracle that signs arbitrary bytes with the one key that also seals
 #      the launcher, the base game and the mirror list, and a signature over attacker-chosen bytes
 #      is not a smaller problem than a leaked key;
-#   3. THE RATCHET           — the serial comes from the DOCUMENT's own bytes, never from the
-#      request, and must exceed everything branch `sealed` records for that payload. This is where
-#      "a serial only ever rises" is enforced for the whole project; it used to be enforced nowhere,
-#      because each producer merely counted from its own published release.
+#   3. ASSIGN THE SERIAL     — one above everything branch `sealed` records for that payload. "A
+#      serial only ever rises" is now a property of how the number is produced rather than a rule a
+#      request is measured against: there is no number in the request to be wrong. Re-dispatching an
+#      identical request is a no-op that spends nothing (see that step's idempotency rule).
 # Only then is `cryptography` installed and the secret read.
 #
 # WHY `workflow_dispatch` AND NOT `repository_dispatch`. The two differ in one thing that matters
@@ -88,10 +98,12 @@ on:
         type: string
 
 permissions:
-  contents: write        # push the signature and the ping to branch `sealed`
+  contents: write        # push the sealed document, its signature and the ping to branch `sealed`
 
-# ONE SEAL AT A TIME, and queued rather than cancelled. The ratchet reads the ledger and then adds
-# to it, so two overlapping runs would both read the same high-water mark; and a cancelled run is
+# ONE SEAL AT A TIME, and queued rather than cancelled. This job reads the ledger's high-water mark
+# and then adds to it — the read-then-add race that used to be split between a producer and this
+# job is now entirely inside it, which is exactly why this must stay: two overlapping runs would
+# both read the same mark and assign the same serial to two different documents. A cancelled run is
 # one that may already have signed, which is not a run any later one supersedes — it is a producer
 # waiting for a file that will never appear. Two payloads sealing at once therefore serialise here,
 # which costs a minute and removes the whole class.
@@ -154,7 +166,7 @@ jobs:
       # A MISSING BRANCH IS A LEGITIMATE STATE — exactly once, before the first payload is ever
       # sealed — and it is told apart from "the ledger could not be read" by ls-remote's exit code,
       # not by guessing from a failed clone. The difference matters: an unreadable ledger read as
-      # empty would let a replayed serial through the ratchet.
+      # empty is one this job would assign serial 1 from, re-issuing a number that is long spent.
       - name: Fetch the ledger
         env:
           GH_TOKEN: ${{ github.token }}
@@ -207,11 +219,9 @@ jobs:
           # The mirror list is its own DOCUMENT KIND, not a fourth manifest: it has no files and no
           # bundles, its format is the registry's generate_mirror_list.py, and `mirrors` is
           # deliberately not in manifest_schema.PAYLOAD_IDS. The two kinds are therefore sealed into
-          # differently NAMED signatures, so nothing downstream can offer one where the other is
-          # expected.
-          MIRRORS = "mirrors"
-          DOC_NAME = {MIRRORS: "mirrors.json"}
-          MANIFEST_NAME = "manifest.json"
+          # differently NAMED documents and signatures (ping.document_name, which the producer's
+          # side reads too), so nothing downstream can offer one where the other is expected.
+          MIRRORS = ping.MIRRORS
 
           FIELDS = ("repo", "tag", "manifest", "trusted_comment")
           # GitHub caps a whole workflow_dispatch `inputs` object at 65,535 characters, so nothing
@@ -227,7 +237,7 @@ jobs:
               sys.exit("REFUSED: " + why)
 
           def read_mirrors(doc):
-              """-> the mirror list's serial, or a refusal. DELIBERATELY only these checks.
+              """Check a mirror list, or refuse it. DELIBERATELY only these checks.
 
               There is no builder here to rebuild a mirror list with, and writing one would be
               exactly the drifting second implementation of a format that build_manifest.validate
@@ -239,19 +249,15 @@ jobs:
               What this authority owes is narrower, and is entirely about what its signature would
               MEAN: the bytes are one unambiguous document (build_manifest.parse, below); the
               document says `mirrors`, so no reader can ever take a signed mirror list for a payload
-              manifest; the serial the ledger ratchets and the ping carries is really in these
-              bytes and is a number a ping can spell; and there is a `mirrors` array, because a
-              document without one is not the thing being asked for."""
+              manifest; its serial is a whole number, which the shared check below then requires to
+              be the 0 of a request; and there is a `mirrors` array, because a document without one
+              is not the thing being asked for."""
               if doc.get("payload_id") != MIRRORS:
                   refuse(f"a mirror list carries payload_id {MIRRORS!r}, and this document carries "
                          f"{doc.get('payload_id')!r}")
               serial = doc.get("serial")
               if isinstance(serial, bool) or not isinstance(serial, int):
                   refuse(f"the mirror list's serial is {serial!r}, and a serial is a whole number")
-              try:
-                  ping.check_serial(serial)      # >= 1, and within the u64 every reader parses
-              except ping.PingError as e:
-                  refuse(f"the mirror list's serial: {e}")
               if not isinstance(doc.get("mirrors"), list):
                   refuse(f"a mirror list carries a `mirrors` array; this document carries "
                          f"{type(doc.get('mirrors')).__name__}")
@@ -313,44 +319,100 @@ jobs:
               serial = doc["serial"]
               what = f"a valid {payload} manifest, {len(doc['files'])} file(s)"
 
-          name = DOC_NAME.get(payload, MANIFEST_NAME)
-          with open(os.path.join(os.environ["WORK"], name), "wb") as fh:
+          # A REQUEST NAMES NO RELEASE. The serial is this job's to write (the next step), so the
+          # only value a request may carry is the one that means "none" — and it has to be checked
+          # rather than overwritten, because a document carrying a real number is a producer that
+          # still believes it chooses, and quietly renumbering it would publish something other than
+          # what that producer thinks it built.
+          if serial != 0:
+              refuse(f"this document carries serial {serial}, and a seal request carries 0 — the "
+                     f"authority assigns serials from its ledger. See docs/sealing.md.")
+
+          # The request's bytes, under a name that is NOT the document's: what gets sealed is what
+          # the next step writes there, at the serial it assigns.
+          with open(os.path.join(os.environ["WORK"], "request.json"), "wb") as fh:
               fh.write(raw)
-          # SERIAL COMES FROM THE DOCUMENT, never from the request: it is the number the signature
-          # will cover, and the ratchet must ask about that one and no other.
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
               for k, v in (("REQ_REPO", repo), ("REQ_TAG", tag), ("TRUSTED_COMMENT", comment),
-                           ("PAYLOAD_ID", payload), ("SERIAL", str(serial)), ("DOC", name)):
+                           ("PAYLOAD_ID", payload), ("DOC", ping.document_name(payload)),
+                           ("REQUEST_FILE", os.path.join(os.environ["WORK"], "request.json"))):
                   fh.write(f"{k}={v}\n")
-          print(f"{repo} {tag}: {what}, serial {serial}, {len(raw)} bytes -> {name}")
+          print(f"{repo} {tag}: {what}, a seal request of {len(raw)} bytes")
           PY
 
-      # THE RATCHET, and the reason this repo is where it belongs: a serial is per-payload and only
-      # ever rises, and until sealing moved here nothing enforced that across producers — each one
-      # merely counted up from its own latest published release, which cannot see a serial that was
-      # sealed and then never published.
+      # ASSIGN THE SERIAL, and the reason this repo is where it belongs: a serial is per-payload and
+      # only ever rises, and while each producer counted up from its own latest published release
+      # nothing could enforce that — a published release cannot see a serial that was sealed and
+      # then never shipped. The number is now produced HERE, one above the ledger's own high-water
+      # mark, so "only ever rises" is not a rule a request can fail: there is no number in a request.
       #
-      # Refusing here leaves the ledger untouched and the run red. The most common cause is benign
-      # and documented: a payload job that died after tooling had already sealed its tag, re-run
-      # without a new serial. Its fetch loop still finds the files the earlier run wrote.
-      - name: Check the serial against the ledger
+      # The document is rendered at that serial and written to $WORK. THOSE bytes are what gets
+      # signed and what the producer publishes — build_manifest.assign is the one function that
+      # writes a serial into a document, and the producer re-runs it over its own request to prove
+      # what came back is its own (phoenix_tooling/dispatch.py).
+      #
+      # IDEMPOTENCY, which replaces the old ratchet refusal: a re-dispatch of a request that was
+      # already sealed under this tag is a no-op. The entry's own document is compared against this
+      # request rendered at the entry's serial, so "already sealed" means the ledger holds the exact
+      # bytes this request would produce — not merely that something was sealed here once. A
+      # producer whose job died after the seal re-runs and gets its files; nothing is signed again
+      # and no serial is spent. Anything else — a changed document, or an entry from before the
+      # document was part of an answer — is a fresh seal at high + 1, overwriting the tag's
+      # directory, which is what a rebuilt tag has always done here.
+      - name: Assign the serial
+        id: assign
         run: |
           set -euo pipefail
           python - <<'PY'
-          import os, sys
-          from phoenix_tooling import ping
+          import os
+          from phoenix_tooling import build_manifest, ping
 
-          payload, serial = os.environ["PAYLOAD_ID"], int(os.environ["SERIAL"])
-          high = ping.ledger_high(os.environ["LEDGER"], payload)
-          if serial <= high:
-              sys.exit(f"REFUSED: {payload} has already been sealed at serial {high}, and this "
-                       f"document carries {serial}. A serial only ever rises: a client holding "
-                       f"{high} would refuse {serial}, silently, and report itself up to date.\n"
-                       f"  If this is a re-run of a payload job that already got its seal, the "
-                       f"files are in the ledger already — fetch them.\n"
-                       f"  If it is a fresh attempt, the producer must pick "
-                       f"max(ledger, published) + 1. See docs/sealing.md.")
-          print(f"{payload}: highest sealed serial {high} -> this request seals {serial}")
+          work, ledger, payload = os.environ["WORK"], os.environ["LEDGER"], os.environ["PAYLOAD_ID"]
+          name = os.environ["DOC"]
+          entry = os.path.join(ledger, ping.LEDGER_DIR, *os.environ["REQ_REPO"].split("/"),
+                               os.environ["REQ_TAG"])
+          with open(os.environ["REQUEST_FILE"], "rb") as fh:
+              request = build_manifest.parse(fh.read())
+
+          def sealed(serial):
+              """The document's exact bytes as sealed at `serial`. A mirror list has no builder to
+              assign through — that is the whole reason its kind exists (see the step above) — so
+              its serial is set on the document as parsed; everything else goes through
+              build_manifest.assign, which validates what it produces. Both render the same way,
+              which is the property the producer's comparison rests on."""
+              if payload == ping.MIRRORS:
+                  return build_manifest.render(dict(request, serial=int(ping.check_serial(serial))))
+              return build_manifest.render(build_manifest.assign(request, serial))
+
+          high = ping.ledger_high(ledger, payload)
+
+          already = None
+          document = os.path.join(entry, name)
+          if os.path.isfile(document) and os.path.isfile(os.path.join(entry, ping.PING_NAME)):
+              was, _ = ping.read_file(os.path.join(entry, ping.PING_NAME))
+              with open(document, "rb") as fh:
+                  have = fh.read()
+              if was["payload"] == payload and have == sealed(was["serial"]):
+                  already = int(was["serial"])
+
+          if already is None:
+              serial = high + 1
+              with open(os.path.join(work, name), "wb") as fh:
+                  fh.write(sealed(serial))
+              print(f"{payload}: highest sealed serial {high} -> this request seals {serial}")
+          else:
+              serial = already
+              print(f"{payload}: this exact document is already sealed at serial {serial} under "
+                    f"{os.environ['REQ_TAG']} — nothing to sign, nothing to push")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
+              fh.write(f"SERIAL={serial}\n")
+          if already is not None:
+              # A step OUTPUT rather than an env var, because the two steps below skip on it and an
+              # `if:` reads outputs by the id of the step that decided — the decision and the skip
+              # are then one thing to follow rather than two.
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+                  fh.write("already_sealed=1\n")
           PY
 
       # FROM THE PINNED CHECKOUT, NOT FROM AN INDEX — the same rule, and the same wheels, every
@@ -370,11 +432,12 @@ jobs:
       # A PING IS MINTED FOR EVERY KIND, including `mirrors`, which no mirror will ever be told
       # about — a mirror's registry entry lists the payload trees it serves (mod/launcher/game) and
       # never the list itself, so phoenix_tooling/notify.py finds no carrier and the registry does
-      # not even call it. It is minted anyway because it makes every ledger entry the same two
+      # not even call it. It is minted anyway because it makes every ledger entry the same three
       # files, and `ping.json` is where phoenix_tooling/ping.py's ledger reads a serial from: a
-      # kind that skipped it would be a kind the ratchet cannot see. `[a-z]+` is the whole of what
+      # kind that skipped it would be a kind the counter cannot see. `[a-z]+` is the whole of what
       # a ping's payload has to satisfy, and `mirrors` satisfies it.
       - name: Seal the document and sign its ping
+        if: steps.assign.outputs.already_sealed != '1'
         env:
           PHOENIX_SIGNING_KEY: ${{ secrets.PHOENIX_SIGNING_KEY }}
         run: |
@@ -393,19 +456,22 @@ jobs:
           python phx.py ping verify "$WORK/ping.json" --pub keys/phoenix-active.pub
           ls -l "$WORK"
 
-      # THE ANSWER, and the ledger entry, in ONE commit: the two files are written together because
-      # phoenix_tooling/ping.py refuses a tag directory carrying only one of them — a half-written
-      # entry would make every later ratchet read fail rather than merely be incomplete.
+      # THE ANSWER, and the ledger entry, in ONE commit: the three files are written together
+      # because phoenix_tooling/ping.py refuses a tag directory carrying only some of them — a
+      # half-written entry would make every later ledger read fail rather than merely be incomplete
+      # — and because the next request under this tag decides "already sealed" by comparing the
+      # document against the ping's serial, which is only an answer if the two arrived together.
       #
       # The push is retried on a non-fast-forward. `concurrency` above should make that impossible,
       # but the cost of being wrong is a producer waiting ten minutes for a file that was signed and
       # then dropped, and the cost of the retry is four lines.
       - name: Publish to the ledger
+        if: steps.assign.outputs.already_sealed != '1'
         run: |
           set -euo pipefail
           entry="$LEDGER/sealed/$REQ_REPO/$REQ_TAG"
           mkdir -p "$entry"
-          cp "$WORK/$DOC.minisig" "$WORK/ping.json" "$entry/"
+          cp "$WORK/$DOC" "$WORK/$DOC.minisig" "$WORK/ping.json" "$entry/"
           cd "$LEDGER"
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -430,12 +496,22 @@ jobs:
           exit 1
 
       - name: Summary
+        env:
+          ALREADY_SEALED: ${{ steps.assign.outputs.already_sealed }}
         run: |
           {
-            echo "### Sealed \`$PAYLOAD_ID\` serial \`$SERIAL\`"
+            if [ "${ALREADY_SEALED:-}" = "1" ]; then
+              echo "### Already sealed: \`$PAYLOAD_ID\` serial \`$SERIAL\`"
+              echo
+              echo "The ledger already carries exactly this document under \`$REQ_TAG\`. Nothing"
+              echo "was signed and no serial was spent; the answer below is the one it already has."
+            else
+              echo "### Sealed \`$PAYLOAD_ID\` serial \`$SERIAL\`"
+            fi
             echo
             echo "Requested by \`$REQ_REPO\` for tag \`$REQ_TAG\`."
             echo
             echo "    git fetch https://github.com/$GITHUB_REPOSITORY $LEDGER_BRANCH"
+            echo "    git show FETCH_HEAD:sealed/$REQ_REPO/$REQ_TAG/$DOC"
             echo "    git show FETCH_HEAD:sealed/$REQ_REPO/$REQ_TAG/$DOC.minisig"
           } >> "$GITHUB_STEP_SUMMARY"

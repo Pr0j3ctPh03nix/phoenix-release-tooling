@@ -42,7 +42,7 @@ WORKFLOW = os.path.join(ROOT, ".github", "workflows", "seal.yml")
 # here, never a silently skipped check.
 REF_STEP = "Refuse to sign on any ref but main"
 REQUEST_STEP = "Read the request"
-RATCHET_STEP = "Check the serial against the ledger"
+ASSIGN_STEP = "Assign the serial"
 
 # The one ref the workflow signs on, and the env var the runner delivers it in. Stated here only to
 # drive the fixtures; the RULE is the workflow's.
@@ -137,18 +137,20 @@ def run_shell(script, env):
 # --- the fixtures ---------------------------------------------------------------------------------
 
 def wire(doc):
-    """The bytes a producer uploads and this authority is asked to sign — the framing both
-    build_manifest.write and the registry's generate_mirror_list.render use."""
-    return json.dumps(doc, indent=2, ensure_ascii=False).encode("utf-8") + b"\n"
+    """The bytes a producer uploads and this authority is asked to sign. build_manifest.render is
+    that framing, and the registry's generate_mirror_list renders identically — which is why one
+    function makes both kinds of fixture here."""
+    return build_manifest.render(doc)
 
 
-def manifest_bytes(payload_id="mod", serial=2_000_042, version="1.0.0"):
-    """A real payload manifest, built the only way one can be (phoenix_tooling/build_manifest.py)."""
+def manifest_bytes(payload_id="mod", serial=0, version="1.0.0"):
+    """A real payload manifest, built the only way one can be (phoenix_tooling/build_manifest.py).
+    Serial 0 by default: what a producer dispatches is a seal REQUEST."""
     e = build_manifest.entry("game/dota/a.bin", "a" * 64, 10, name="a.bin")
     return wire(build_manifest.build(payload_id, version, serial, [e]))
 
 
-def mirrors_bytes(serial=2, **over):
+def mirrors_bytes(serial=0, **over):
     """A mirror list shaped exactly as the registry's generate_mirror_list.build renders one."""
     doc = {"format": 1, "payload_id": "mirrors", "serial": serial,
            "signed_at": "2026-09-01T11:00:00Z",
@@ -163,12 +165,16 @@ def encoded(raw):
     return base64.b64encode(gzip.compress(raw)).decode("ascii")
 
 
-def ledger_entry(root, repo, tag, payload, serial, sig_name):
+def ledger_entry(root, repo, tag, payload, serial, sig_name, document=None):
     """One entry on the `sealed` branch, as the workflow's last step writes it.
 
     The ping is structurally valid and NOT signed: `ping.ledger_high` reads the serial out of it and
     checks no signature (it must stay stdlib-only — see that function), so minting a keypair here
-    would only make this file depend on `cryptography` to test something it does not use."""
+    would only make this file depend on `cryptography` to test something it does not use.
+
+    `document` is the sealed document's bytes. Omitted, this writes the two-file entry every seal
+    before the serial moved here left behind — which the assign step must read as "not sealed the
+    way I would seal it" rather than as a broken entry."""
     d = os.path.join(root, ping.LEDGER_DIR, *repo.split("/"), tag)
     os.makedirs(d, exist_ok=True)
     with open(os.path.join(d, ping.PING_NAME), "w", encoding="utf-8", newline="\n") as fh:
@@ -176,6 +182,9 @@ def ledger_entry(root, repo, tag, payload, serial, sig_name):
                    "sig": base64.b64encode(b"\0" * ping.SIG_LEN).decode("ascii")}, fh)
     with open(os.path.join(d, sig_name), "w", encoding="utf-8", newline="\n") as fh:
         fh.write("untrusted comment: a rehearsal\n")
+    if document is not None:
+        with open(os.path.join(d, sig_name[:-len(ping.SIG_SUFFIX)]), "wb") as fh:
+            fh.write(document)
     return d
 
 
@@ -185,7 +194,7 @@ def _selftest():
     text = open(WORKFLOW, encoding="utf-8").read()
     ref_script = step_run(text, REF_STEP)
     request_script = heredoc(step_run(text, REQUEST_STEP))
-    ratchet_script = heredoc(step_run(text, RATCHET_STEP))
+    assign_script = heredoc(step_run(text, ASSIGN_STEP))
 
     results = []
 
@@ -228,10 +237,12 @@ def _selftest():
         assert_(code == 0, f"exit {code}: {out}")
         for k, v in expect.items():
             assert_(env.get(k) == v, f"{k} is {env.get(k)!r}, expected {v!r}")
-        # A step that accepted must have written the document it accepted, under the name it
-        # exported: that file is what the seal step signs.
-        assert_(os.path.isfile(os.path.join(env["WORK"], env["DOC"])),
-                f"{env['DOC']} was not written")
+        # A step that accepted must have written the REQUEST it accepted — not the document, which
+        # does not exist yet: the next step is what renders it, at the serial it assigns.
+        assert_(os.path.isfile(env["REQUEST_FILE"]), "the request bytes were not written")
+        assert_(not os.path.exists(os.path.join(env["WORK"], env["DOC"])),
+                f"{env['DOC']} exists already, before a serial has been assigned")
+        assert_("SERIAL" not in env, "the request step must not export a serial")
 
     def refused(res, needle=""):
         code, out, _ = res
@@ -254,7 +265,10 @@ def _selftest():
     # --- 1. THE REQUEST: a closed set of four fields ---------------------------------------------
     ok("a valid mod manifest from client-dist-staging is accepted",
        lambda: accepted(request("Pr0j3ctPh03nix/client-dist-staging"),
-                        PAYLOAD_ID="mod", SERIAL="2000042", DOC="manifest.json"))
+                        PAYLOAD_ID="mod", DOC="manifest.json"))
+    ok("a manifest that already names a release is refused — the authority picks the serial",
+       lambda: refused(request("Pr0j3ctPh03nix/client-dist-staging",
+                               manifest_bytes(serial=2_000_042)), "a seal request carries 0"))
     ok("inputs carrying a fifth key are refused",
        lambda: refused(request("Pr0j3ctPh03nix/client-dist-staging", note="hello"),
                        "expected exactly"))
@@ -286,9 +300,12 @@ def _selftest():
 
     # --- 3. THE MIRROR REGISTRY, the one repo that may seal a document that is not a manifest ----
     ok("a valid mirrors.json from the registry is accepted, and sealed under its own name",
-       lambda: accepted(request("Pr0j3ctPh03nix/phoenix-mirror-registry", mirrors_bytes(serial=2),
-                                tag="v2", comment="phoenix mirrors serial 2"),
-                        PAYLOAD_ID="mirrors", SERIAL="2", DOC="mirrors.json"))
+       lambda: accepted(request("Pr0j3ctPh03nix/phoenix-mirror-registry", mirrors_bytes(),
+                                tag="v2", comment="phoenix mirror list"),
+                        PAYLOAD_ID="mirrors", DOC="mirrors.json"))
+    ok("a mirror list that already names a release is refused, exactly as a manifest is",
+       lambda: refused(request("Pr0j3ctPh03nix/phoenix-mirror-registry", mirrors_bytes(serial=2)),
+                       "a seal request carries 0"))
     ok("the SAME mirror list dispatched by the mod's repo is refused",
        lambda: refused(request("Pr0j3ctPh03nix/client-dist-staging", mirrors_bytes()),
                        "not a manifest this repo would build"))
@@ -301,9 +318,6 @@ def _selftest():
     ok("a mirror list with no `mirrors` array is refused",
        lambda: refused(request("Pr0j3ctPh03nix/phoenix-mirror-registry",
                                mirrors_bytes(mirrors={"phx-fi-1": {}})), "`mirrors` array"))
-    ok("a mirror list at serial 0 is refused — the ratchet is strictly-greater, so it is unusable",
-       lambda: refused(request("Pr0j3ctPh03nix/phoenix-mirror-registry", mirrors_bytes(serial=0)),
-                       "serial"))
     ok("a mirror list whose serial is a string is refused",
        lambda: refused(request("Pr0j3ctPh03nix/phoenix-mirror-registry", mirrors_bytes(serial="2")),
                        "whole number"))
@@ -324,30 +338,94 @@ def _selftest():
        lambda: assert_(listed - covered == {"Pr0j3ctPh03nix/client-dist"},
                        f"map: {sorted(listed)}, covered: {sorted(covered)}"))
 
-    # --- 4. THE RATCHET, over a ledger holding both kinds of entry -------------------------------
+    # --- 4. ASSIGNING THE SERIAL, over a ledger holding both kinds of entry ----------------------
+    # The step's own output is two things: the number it exports, and the document it renders at
+    # that number. Both are checked, because the second is what gets signed.
     ledger = os.path.join(tmp, "ledger")
     ledger_entry(ledger, "Pr0j3ctPh03nix/client-dist-staging", "v1.0.0", "mod", 2_000_042,
                  "manifest.json.minisig")
     ledger_entry(ledger, "Pr0j3ctPh03nix/phoenix-mirror-registry", "v2", "mirrors", 2,
                  "mirrors.json.minisig")
+    empty_ledger = os.path.join(tmp, "empty-ledger")
+    os.makedirs(os.path.join(empty_ledger, ping.LEDGER_DIR))
 
-    def ratchet(payload, serial):
-        return run_python(ratchet_script, {"PAYLOAD_ID": payload, "SERIAL": str(serial),
-                                           "LEDGER": ledger})
+    def assign(payload, ledger_path, raw=None, repo="Pr0j3ctPh03nix/client-dist-staging",
+               tag="v1.2.3"):
+        """Hand the real step a request and a ledger. -> (exit, output, exported, outputs, WORK)."""
+        raw = manifest_bytes() if raw is None else raw
+        work = tempfile.mkdtemp(dir=tmp)
+        request_file = os.path.join(work, "request.json")
+        with open(request_file, "wb") as fh:
+            fh.write(raw)
+        env_file, out_file = os.path.join(work, "github.env"), os.path.join(work, "github.out")
+        for f in (env_file, out_file):
+            open(f, "w").close()
+        code, out = run_python(assign_script, {
+            "WORK": work, "LEDGER": ledger_path, "PAYLOAD_ID": payload, "REQ_REPO": repo,
+            "REQ_TAG": tag, "DOC": ping.document_name(payload), "REQUEST_FILE": request_file,
+            "GITHUB_ENV": env_file, "GITHUB_OUTPUT": out_file})
 
-    rose = ratchet("mirrors", 3)
-    ok("a mirrors serial above the ledger's is allowed through",
-       lambda: assert_(rose[0] == 0, rose[1]))
-    ok("the mirrors serial already sealed is refused",
-       lambda: assert_(ratchet("mirrors", 2)[0] != 0, "a spent serial was allowed"))
-    ok("a mirrors serial below the ledger's is refused",
-       lambda: assert_(ratchet("mirrors", 1)[0] != 0, "a lower serial was allowed"))
-    spent_mod = ratchet("mod", 2_000_042)
+        def read(path):
+            return dict(ln.split("=", 1) for ln in
+                        open(path, encoding="utf-8").read().splitlines() if "=" in ln)
+
+        return code, out, read(env_file), read(out_file), work
+
+    def assigned(res, serial, already=False):
+        """What the step must have done, for a run over the default mod request."""
+        code, out, env, outputs, work = res
+        assert_(code == 0, f"exit {code}: {out}")
+        assert_(env.get("SERIAL") == str(serial), f"SERIAL is {env.get('SERIAL')!r}, want {serial}")
+        assert_(outputs.get("already_sealed") == ("1" if already else None),
+                f"already_sealed is {outputs.get('already_sealed')!r}")
+        document = os.path.join(work, ping.document_name("mod"))
+        if already:
+            assert_(not os.path.exists(document), "a no-op step rendered a document to sign")
+        else:
+            with open(document, "rb") as fh:
+                assert_(fh.read() == build_manifest.render(
+                    build_manifest.assign(build_manifest.parse(manifest_bytes()), serial)),
+                    "the rendered document is not this request at that serial")
+
+    ok("an empty ledger assigns 1 — the first serial a payload line ever has",
+       lambda: assigned(assign("mod", empty_ledger), 1))
+    ok("a seeded ledger assigns one above its high-water mark",
+       lambda: assigned(assign("mod", ledger), 2_000_043))
     ok("one payload line's ledger does not hold another's back",
-       lambda: assert_(rose[0] == 0 and spent_mod[0] != 0,
-                       "the two lines are being compared against each other"))
-    ok("a payload nothing has ever sealed starts from 1",
-       lambda: assert_(ratchet("game", 1)[0] == 0, "an empty line refused its first serial"))
+       lambda: assert_(assign("mirrors", ledger, mirrors_bytes(),
+                              repo="Pr0j3ctPh03nix/phoenix-mirror-registry",
+                              tag="v3")[2].get("SERIAL") == "3", "the two lines are one counter"))
+    ok("a payload nothing has ever sealed starts from 1, on a ledger others have used",
+       lambda: assert_(assign("launcher", ledger,
+                              manifest_bytes(payload_id="launcher"),
+                              repo="Pr0j3ctPh03nix/phoenix-launcher")[2].get("SERIAL") == "1",
+                       "an untouched line did not start at 1"))
+
+    # IDEMPOTENCY: the same request, under the same tag, after it was already sealed. The entry's
+    # document is what decides — "sealed at N" only counts if the ledger holds the exact bytes this
+    # request renders to at N.
+    same = os.path.join(tmp, "already")
+    already_at = 2_000_100
+    ledger_entry(same, "Pr0j3ctPh03nix/client-dist-staging", "v1.2.3", "mod", already_at,
+                 "manifest.json.minisig",
+                 document=build_manifest.render(
+                     build_manifest.assign(build_manifest.parse(manifest_bytes()), already_at)))
+    ok("a re-dispatch of a request that is already sealed is a no-op at the SAME serial",
+       lambda: assigned(assign("mod", same), already_at, already=True))
+
+    different = os.path.join(tmp, "different")
+    ledger_entry(different, "Pr0j3ctPh03nix/client-dist-staging", "v1.2.3", "mod", already_at,
+                 "manifest.json.minisig",
+                 document=build_manifest.render(build_manifest.assign(
+                     build_manifest.parse(manifest_bytes(version="9.9.9")), already_at)))
+    ok("a DIFFERENT document under a tag that was already sealed is a fresh seal, one higher",
+       lambda: assigned(assign("mod", different), already_at + 1))
+
+    old = os.path.join(tmp, "old-style")
+    ledger_entry(old, "Pr0j3ctPh03nix/client-dist-staging", "v1.2.3", "mod", already_at,
+                 "manifest.json.minisig")
+    ok("an entry from before the document was part of an answer is a fresh seal, not a no-op",
+       lambda: assigned(assign("mod", old), already_at + 1))
 
     shutil.rmtree(tmp, ignore_errors=True)
 
