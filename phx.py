@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The one CLI over `phoenix_tooling` — `phx <module> <the module's own arguments>`.
 
-    python phx.py manifest  selftest | validate <manifest.json>
+    python phx.py manifest  selftest | validate <manifest.json> | assign --serial N <request.json>
     python phx.py minisign  keygen | sign | verify | selftest
     python phx.py seal      seal --manifest ... --pub ... --trusted-comment ...
     python phx.py ping      sign | verify | ledger | selftest

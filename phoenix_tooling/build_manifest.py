@@ -1368,6 +1368,27 @@ def _selftest():
     ok("a serial given as decimal text assigns the same document as the int",
        a_serial_as_text_assigns_the_same_document)
 
+    def assign_cli_rewrites_the_file_in_place():
+        import subprocess
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "manifest.json")
+        e = entry("game/dota/a.bin", sha("a"), 10, name="a.bin")
+        req = write(path, "mod", "1.0.0", entries=[e])
+        cli = [sys.executable, os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "phx.py"), "manifest", "assign", "--serial"]
+        p = subprocess.run([*cli, "2000042", path], capture_output=True)
+        assert_(p.returncode == 0, f"exit {p.returncode}: {p.stdout + p.stderr!r}")
+        with open(path, "rb") as fh:
+            on_disk = fh.read()
+        # Byte-exact: what lands on disk is what the authority would have signed for this request.
+        assert_(on_disk == render(assign(req, 2_000_042)),
+                "the file was not rewritten as the request at the assigned serial")
+        assert_(subprocess.run([*cli, "7", path], capture_output=True).returncode != 0,
+                "a document that already names a release was assigned again")
+
+    ok("`phx manifest assign` numbers a request in place, once",
+       assign_cli_rewrites_the_file_in_place)
+
     refused("assigning to a document that already names a release",
             lambda: assign(assign(request(), 7), 8))
     refused("a document with no serial at all", lambda: assign({"payload_id": "mod"}, 7))
@@ -1409,7 +1430,22 @@ def main(argv=None):
         print(f"ok {argv[1]} — schema {doc['schema']}, payload {doc['payload_id']}, "
               f"{serial}, {len(doc['files'])} file(s)")
         return
-    sys.exit("usage: phx manifest selftest | validate <manifest.json>")
+    # `assign` is a CLI for the one release that cannot ask the authority to number it: a RECOVERY
+    # release, sealed by hand under the recovery key (client-dist-staging/docs/release-keys.md).
+    # Rewrites the file in place with exactly the bytes the authority would have signed.
+    if len(argv) == 4 and argv[0] == "assign" and argv[1] == "--serial":
+        with open(argv[3], "rb") as fh:
+            raw = fh.read()
+        try:
+            doc = assign(parse(raw), argv[2])
+        except (ValueError, TypeError) as e:
+            sys.exit(f"REFUSED {argv[3]}\n  {e}")
+        with open(argv[3], "wb") as fh:
+            fh.write(render(doc))
+        print(f"ok {argv[3]} — assigned serial {doc['serial']}")
+        return
+    sys.exit("usage: phx manifest selftest | validate <manifest.json> | "
+             "assign --serial <N> <request.json>")
 
 
 if __name__ == "__main__":

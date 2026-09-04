@@ -194,12 +194,13 @@ serial does not exist until the seal is done, and the tag names the ledger direc
 filed under. Anything matching `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` will do; that choice belongs to
 that repository, not here.
 
-There is no mirror ping to deliver: the ping minted for a mirror list is never sent. A mirror's
-registry entry lists the payload *trees* it serves (`mod`, `launcher`, `game`) and never the list
-itself, so `phx notify` finds no carrier and a mirror would answer `/sync/mirrors` with a 404. It is
-minted anyway so that every ledger entry is the same three files — `ping.json` is where the
-authority reads a sealed serial from, and a kind that skipped it would be a kind the counter cannot
-see.
+The ping minted for a mirror list is delivered like any other — the action does not special-case
+it — but today it reaches nobody: a mirror's registry entry lists the payload *trees* it serves
+(`mod`, `launcher`, `game`) and never the list itself, so `phx notify` finds no carrier, and a mirror
+would answer `/sync/mirrors` with a 404. Teaching mirrors to carry the list is the mirror app's and
+the registry's change to make; nothing here needs to change for it. The ping is minted regardless so
+that every ledger entry is the same three files — `ping.json` is where the authority reads a sealed
+serial from, and a kind that skipped it would be a kind the counter cannot see.
 
 ## What this does not cover
 
