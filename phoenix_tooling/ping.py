@@ -42,8 +42,9 @@ THE SERIAL IS A STRING in the JSON. A serial is a u64 and the mirror app is Type
 reader unharmed, and the signed message is built from that same text.
 
 STDLIB ONLY UNLESS IT SIGNS. `cryptography` is imported inside `sign`/`verify`, never at module
-scope, because `ledger` runs in each PRODUCER's CI -- before (and instead of) any wheel install --
-to pick the next serial. See `ledger_high`.
+scope, because `ledger` runs in the signing authority's job BEFORE the signing wheel is installed
+-- assigning the next serial is a gate, and a request refused at a gate installs nothing. See
+`ledger_high`.
 """
 import argparse
 import base64
@@ -60,10 +61,11 @@ from . import manifest_schema as schema   # for U64_MAX only; this module import
 MAGIC = b"phoenix-ping"
 SEP = b"\n"
 PAYLOAD_RE = re.compile(r"\A[a-z]+\Z")
-# No sign, no leading zero, no '.', no exponent -- and no zero: the ledger reads an empty ledger as
-# 0 and the ratchet is strictly-greater, so serial 0 is a number no payload can ever be sealed at.
-# (The FORMAT allows it -- manifest_schema's `serial` is Int(min=0) -- because that is the widest
-# honest statement about a u64; refusing it is the signing authority's rule, not the format's.)
+# No sign, no leading zero, no '.', no exponent -- and no zero: an empty ledger reads as 0 and the
+# authority assigns one above it, so 0 is a number no payload is ever sealed at. That is exactly
+# what makes it usable as the "no release yet" marker a seal request carries. (The FORMAT allows it
+# -- manifest_schema's `serial` is Int(min=0) -- because that is the widest honest statement about a
+# u64; refusing it here is what a ping means, not what the format says.)
 SERIAL_RE = re.compile(r"\A[1-9][0-9]*\Z")
 
 # The ping document. Exactly these four keys, no more: a reader that ignores unknown keys cannot
@@ -76,14 +78,31 @@ KEY_ID_LEN = 8                # minisign's key id, hex-encoded in the document
 
 # --- the ledger: where a sealed payload's serial is recorded ---------------------------------------
 
-# The sealing workflow commits `<LEDGER_DIR>/<owner>/<name>/<tag>/{<document>.minisig,ping.json}` to
-# the branch `sealed`, where <document> is the file that was sealed -- `manifest.json` for a payload
-# manifest, `mirrors.json` for the mirror list. These names are part of what the producers fetch, so
-# they live here rather than in the workflow that writes them; and because the signature is named
-# after the DOCUMENT, what a ledger entry can be checked for is the SUFFIX, never one filename.
+# The sealing workflow commits `<LEDGER_DIR>/<owner>/<name>/<tag>/{<document>,<document>.minisig,
+# ping.json}` to the branch `sealed`, where <document> is the file that was sealed -- see
+# `document_name` below. The document itself is there because the authority is what WRITES the
+# serial into it: the bytes that were signed are the answer, not merely a signature over bytes the
+# producer already had. These names are part of what the producers fetch, so they live here rather
+# than in the workflow that writes them; and because the signature is named after the DOCUMENT,
+# what a ledger entry can be checked for is the SUFFIX, never one filename.
 LEDGER_DIR = "sealed"
 PING_NAME = "ping.json"
 SIG_SUFFIX = ".minisig"
+
+# The one document kind that is not a payload manifest: the mirror registry's list. It is not a
+# manifest_schema.PAYLOAD_ID and never will be (see the docstring), so the name it seals under is
+# the only thing that has to be agreed on, and it is agreed on HERE -- the authority writes the
+# entry (.github/workflows/seal.yml) and the producer reads it back (phoenix_tooling/dispatch.py),
+# and a name each side spelled for itself would be a ledger entry only one of them could find.
+MIRRORS = "mirrors"
+MANIFEST_DOCUMENT = "manifest.json"
+DOCUMENTS = {MIRRORS: "mirrors.json"}
+
+
+def document_name(payload_id):
+    """-> the filename this payload's sealed document is filed under, in the ledger and on the
+    release. Everything but the mirror list is a payload manifest."""
+    return DOCUMENTS.get(payload_id, MANIFEST_DOCUMENT)
 
 
 class PingError(Exception):
@@ -245,7 +264,12 @@ def ledger_entries(root):
     one `*.minisig` -- the signature is named after the DOCUMENT it covers, which differs by kind
     (see SIG_SUFFIX), so the rule cannot be one filename without the ledger refusing every entry
     whose document is not a manifest. Either half missing is a PingError rather than a skip -- see
-    ledger_high."""
+    ledger_high.
+
+    The DOCUMENT is not required, though every seal now writes one: entries sealed before it was
+    part of an answer carry only these two files, and they are perfectly good ledger lines -- the
+    serial in them was spent. What the missing document costs them is only the authority's
+    idempotency check, which then reads such an entry as "not sealed the way I would seal it"."""
     out = []
     for owner in sorted(_subdirs(root)):
         for name in sorted(_subdirs(os.path.join(root, owner))):
@@ -281,18 +305,20 @@ def _files(path):
 def ledger_high(path, payload):
     """-> the highest serial ever sealed for `payload`, or 0 if none ever was.
 
-    THE RATCHET READS THIS, at the signing authority: a manifest whose serial is not strictly
-    greater is refused, so one payload line can never be sealed at a number it already used --
-    including on a rebuild of a tag that was already sealed.
+    THE SIGNING AUTHORITY READS THIS, and it is the only thing that does so to decide a number:
+    the serial it assigns is `this + 1` (.github/workflows/seal.yml), so one payload line can never
+    be sealed at a number it already used -- including on a rebuild of a tag that was already
+    sealed, and including a number that was sealed but never published. A producer used to compute
+    the same thing for itself and no longer does: it sends a document at serial 0 and is handed
+    back the one it was sealed at.
 
-    THE PRODUCERS READ IT TOO, and must: a producer picks `max(this, the published serial) + 1`.
-    "Published + 1" alone was correct only while sealing and publishing were the same job. They are
-    not any more -- a payload job can be sealed at N and then die before it undrafts, leaving N
-    sealed and nothing published, after which "published + 1" proposes N forever and this ratchet
-    correctly refuses it forever. That is why this function is a CLI subcommand and why it must not
-    need `cryptography`: it runs in a producer's CI, before any wheel install.
+    Nothing else reads it to decide anything. A person reads it (`phx ping ledger`) to see where a
+    line stands; the mirror app never sees the ledger at all -- what it acts on is the signed ping.
+    It must still not need `cryptography`: it runs in the authority's job BEFORE the signing wheel
+    is installed, which is deliberate (a request refused at the gates installs nothing), and the
+    rehearsal drives that same step with nothing installed at all.
 
-    A malformed entry is REFUSED, never skipped, because this number is the whole ratchet: the one
+    A malformed entry is REFUSED, never skipped, because this number is the whole counter: the one
     thing an unreadable entry could be hiding is a serial higher than the one we would otherwise
     return, and skipping it silently lowers the high-water mark. What the ledger is NOT is
     self-authenticating -- nothing here checks the ping signatures it reads (that would need the
@@ -418,8 +444,13 @@ def _selftest():
     # --- the ledger ------------------------------------------------------------------------------
     # The two document names the sealing authority writes -- see SIG_SUFFIX. The ledger must read
     # both, which is why its rule is the suffix rather than either of these strings.
-    manifest_sig = "manifest.json" + SIG_SUFFIX
-    mirrors_sig = "mirrors.json" + SIG_SUFFIX
+    ok("every payload line but the mirror list seals a manifest",
+       lambda: assert_({document_name(p) for p in ("mod", "launcher", "game")}
+                       == {MANIFEST_DOCUMENT}, "a payload line seals something else"))
+    ok("the mirror list seals under its own name",
+       lambda: assert_(document_name(MIRRORS) == "mirrors.json", document_name(MIRRORS)))
+    manifest_sig = document_name("mod") + SIG_SUFFIX
+    mirrors_sig = document_name(MIRRORS) + SIG_SUFFIX
 
     with tempfile.TemporaryDirectory() as tmp:
         def write_entry(repo, tag, payload, serial, body=None, sig_name=manifest_sig):
@@ -447,7 +478,7 @@ def _selftest():
         write_entry("Pr0j3ctPh03nix/phoenix-launcher", "v1.5.2", "launcher", 3_000_009)
         # The mirror registry seals a document that is not a manifest, so its entry's signature is
         # named mirrors.json.minisig. It is a sealed entry like any other and the ledger must read
-        # it -- the ratchet the registry counts from is this number.
+        # it -- the number the authority counts that line from is this one.
         write_entry("Pr0j3ctPh03nix/phoenix-mirror-registry", "v2", "mirrors", 2,
                     sig_name=mirrors_sig)
         with open(os.path.join(tmp, LEDGER_DIR, "README.md"), "w", encoding="utf-8") as fh:
