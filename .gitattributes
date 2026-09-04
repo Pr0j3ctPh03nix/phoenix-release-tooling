@@ -10,5 +10,5 @@
 # rather than `-text` because there is no diff of a zip worth showing either.
 *.whl binary
 
-# SHA256SUMS is read back by tools/wheels_check.py, which writes it with LF and splits on "  ".
+# SHA256SUMS is read back by phoenix_tooling/wheels.py, which writes it with LF and splits on "  ".
 wheels/SHA256SUMS -text

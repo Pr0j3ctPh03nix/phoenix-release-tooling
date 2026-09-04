@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Ping every published mirror so it syncs the release that was just published.
 
-    python tools/notify_mirrors.py notify --ping-file ping.json           # the published registry
-    python tools/notify_mirrors.py notify --ping-file ping.json --list mirrors.json --strict
-    python tools/notify_mirrors.py selftest
+    python phx.py notify notify --ping-file ping.json           # the published registry
+    python phx.py notify notify --ping-file ping.json --list mirrors.json --strict
+    python phx.py notify selftest
 
 ONE copy, because there are three producers and a mirror must not hear about a release three
 different ways: the mod in dist's CI, the launcher in its own, the base game by hand. Each already
@@ -13,11 +13,11 @@ else it reads from here — and the one thing every producer does after publishi
 WHO MINTS THE PING is not this script and not the producer: it is the signing authority, in the same
 job that sealed the manifest (.github/workflows/seal.yml), and a producer fetches it from branch
 `sealed` beside the signature — see docs/sealing.md. The by-hand base game is the exception that
-proves it: whoever holds the key mints its ping with `tools/ping.py sign --sec`, because they are
-the authority that day.
+proves it: whoever holds the key mints its ping with `phoenix_tooling/ping.py sign --sec`, because
+they are the authority that day.
 
-WHAT IS DELIVERED is the SIGNED ping document tools/ping.py minted at the moment the payload was
-sealed — `--ping-file`, POSTed verbatim as the request body:
+WHAT IS DELIVERED is the SIGNED ping document phoenix_tooling/ping.py minted at the moment the
+payload was sealed — `--ping-file`, POSTed verbatim as the request body:
 
     POST <base_url>/sync/<payload>          Content-Type: application/json
     body: the exact bytes of ping.json      (payload, serial, key_id, sig)
@@ -30,9 +30,9 @@ Mirrors pull from GitHub on a timer; this only says "now, and here is the serial
 unauthenticated and rate-limited on the mirror's side — nothing here carries a credential, and a
 mirror is free to ignore the ping — but it is no longer CONTENTLESS: the serial in the body is a
 number a mirror acts on, so it is signed with the release key and the mirror checks it before
-believing it (see tools/ping.py for the message and why it is not a .minisig). That is also what
-makes the courier irrelevant: anyone may deliver this document, so a producer that dies before
-pinging costs nothing a later run cannot redo.
+believing it (see phoenix_tooling/ping.py for the message and why it is not a .minisig). That is
+also what makes the courier irrelevant: anyone may deliver this document, so a producer that dies
+before pinging costs nothing a later run cannot redo.
 
 The list of mirrors is the registry's latest release asset `mirrors.json`
 (Pr0j3ctPh03nix/phoenix-mirror-registry — public, hence no token), whose format is that repo's
@@ -62,8 +62,8 @@ document can make a release runner open anything but an HTTP request to the host
 
 Stdlib only, like everything here that is not the signer: this runs in release CI right after the
 sealed release is published, and a `pip install` is an input that pipeline does not need. The one
-import from this repo is tools/ping.py, which is stdlib-only until it signs or verifies — this reads
-a ping, it never makes one.
+import from this repo is phoenix_tooling/ping.py, which is stdlib-only until it signs or verifies
+— this reads a ping, it never makes one.
 """
 import argparse
 import json
@@ -76,16 +76,16 @@ import urllib.request
 from collections import namedtuple
 from typing import NoReturn
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import ping  # noqa: E402 — the ping document's shape, owned by the tool that signs it
+from . import ping                  # the ping document's shape, owned by the tool that signs it
+from ._paths import ROOT
 
 REGISTRY = "Pr0j3ctPh03nix/phoenix-mirror-registry"
 LATEST = "https://api.github.com/repos/{}/releases/latest"
 LIST_ASSET = "mirrors.json"
 
 # The mirror's sync endpoint: `<base_url>/sync/<payload>`. Part of the mirror app's contract, not a
-# local naming choice — the payload is a path segment there, which is why tools/ping.py closes that
-# id to [a-z]+.
+# local naming choice — the payload is a path segment there, which is why phoenix_tooling/ping.py
+# closes that id to [a-z]+.
 SYNC_PATH = "/sync"
 CONTENT_TYPE = "application/json"
 
@@ -191,8 +191,8 @@ def sync_url(base_url, payload):
 
     The trailing slash is stripped for the same reason the registry refuses one: the launcher's
     canonical form has none, and `//sync` is a different path on plenty of servers. `payload` is
-    interpolated raw because it has already been through tools/ping.py's `[a-z]+` — there is no
-    escaping to get wrong, which is exactly why that rule is that narrow."""
+    interpolated raw because it has already been through phoenix_tooling/ping.py's `[a-z]+` —
+    there is no escaping to get wrong, which is exactly why that rule is that narrow."""
     url = base_url.strip()
     parts = urllib.parse.urlsplit(url)
     if parts.scheme not in SCHEMES or not parts.netloc:
@@ -358,7 +358,10 @@ def _selftest():
     srv = _fixture_server()
     base = "http://127.0.0.1:{}".format(srv.server_port)
     dead = "http://127.0.0.1:{}".format(_closed_port())
-    me = os.path.abspath(__file__)
+    # The router, not this file: a module inside a package is not runnable as a bare script, and
+    # `phx.py` is what a producer's workflow actually invokes. Running it by path also puts the repo
+    # root on the child's sys.path by itself, so the subprocess needs no cwd or PYTHONPATH of ours.
+    cli = [sys.executable, os.path.join(ROOT, "phx.py"), "notify"]
 
     try:
         with tempfile.TemporaryDirectory() as tmp:
@@ -383,8 +386,8 @@ def _selftest():
 
             # A real ping document, but not a real signature: nothing in this script verifies one —
             # a courier that checked would still be a courier — so minting a keypair here would
-            # only make an stdlib-only test depend on `cryptography`. tools/ping.py's own selftest
-            # owns the signature.
+            # only make an stdlib-only test depend on `cryptography`. phoenix_tooling/ping.py's
+            # own selftest owns the signature.
             ping_path = write_ping("ping.json", {
                 "payload": "mod", "serial": "2000042", "key_id": "0011223344556677",
                 "sig": "A" * 86 + "=="})
@@ -393,7 +396,7 @@ def _selftest():
 
             def run(path, *extra, ping_file=ping_path):
                 """-> (exit code, everything it printed)."""
-                p = subprocess.run([sys.executable, me, "notify", "--ping-file", ping_file,
+                p = subprocess.run([*cli, "notify", "--ping-file", ping_file,
                                     "--list", path, *extra], capture_output=True)
                 return p.returncode, (p.stdout + p.stderr).decode("utf-8", "replace")
 
@@ -511,14 +514,14 @@ def _selftest():
                lambda: assert_(run(good, "--retries", "0")[0] != 0, "--retries 0 was accepted"))
             ok("--list and --registry name two sources and are refused together",
                lambda: assert_(subprocess.run(
-                   [sys.executable, me, "notify", "--ping-file", ping_path,
+                   [*cli, "notify", "--ping-file", ping_path,
                     "--list", good, "--registry", "a/b"],
                    capture_output=True).returncode != 0, "two sources were accepted"))
 
             # --- the ping file is the run's other input, and it fails the same way the list does --
             ok("notify without --ping-file is a bad argument, not a contentless ping",
                lambda: assert_(subprocess.run(
-                   [sys.executable, me, "notify", "--list", good],
+                   [*cli, "notify", "--list", good],
                    capture_output=True).returncode != 0, "a ping-less notify was accepted"))
             before_bad = len(srv.seen)
             not_a_ping = write_ping("notaping.json", {"payload": "mod", "serial": "2000042"})
@@ -549,13 +552,13 @@ def _selftest():
 
 # --- CLI ------------------------------------------------------------------------------------------
 
-def main():
+def main(argv=None):
     # BOTH streams: the report goes to stderr and carries names and URLs out of a document this
     # repo did not write, on a box whose default encoding is not UTF-8.
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap = argparse.ArgumentParser(prog="phx notify", description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     n = sub.add_parser("notify", help="ping every published mirror that carries this payload")
@@ -563,7 +566,7 @@ def main():
     # document, so the thing that decides which mirrors are contacted is the same thing the mirror
     # itself verifies. A flag would be a second, unsigned answer to that question.
     n.add_argument("--ping-file", required=True, metavar="PATH",
-                   help="the signed ping tools/ping.py minted for this release")
+                   help="the signed ping phoenix_tooling/ping.py minted for this release")
     src = n.add_mutually_exclusive_group()
     src.add_argument("--registry", default=REGISTRY,
                      help="owner/name whose latest release carries {} (default: %(default)s)"
@@ -582,7 +585,7 @@ def main():
                         "authenticated rate limit (default: %(default)s)")
 
     sub.add_parser("selftest", help="check the exit-status contract against a local fixture")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
 
     if a.cmd == "selftest":
         sys.exit(1 if _selftest() else 0)

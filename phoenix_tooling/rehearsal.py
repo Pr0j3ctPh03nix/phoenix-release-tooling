@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Rehearse .github/workflows/seal.yml — run the authority's own gates, off GitHub.
 
-    python tools/seal_rehearsal.py selftest
+    python phx.py rehearsal selftest
 
 WHY THIS EXISTS AS A FILE. The gates that decide what the release key signs are written INSIDE the
 workflow, on purpose: who may ask for what is a fact about publishing, not about any format, and the
@@ -17,8 +17,9 @@ stops being a heredoc, this fails loudly rather than quietly testing nothing —
 
 WHAT IT CANNOT SEE: everything after the gates. `cryptography` is not installed here, no key
 exists, and the ledger is a directory rather than a branch — so the seal, the ping and the push are
-tools/seal.py's and tools/ping.py's own selftests to cover, and the ledger's shape is checked
-through the same `ping.ledger_high` the workflow calls. What this owns is the decision to sign.
+phoenix_tooling/seal.py's and phoenix_tooling/ping.py's own selftests to cover, and the ledger's
+shape is checked through the same `ping.ledger_high` the workflow calls. What this owns is the
+decision to sign.
 
 Stdlib only, like everything here that does not sign.
 """
@@ -32,11 +33,9 @@ import subprocess
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import build_manifest  # noqa: E402
-import ping  # noqa: E402
+from . import build_manifest, ping
+from ._paths import ROOT
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKFLOW = os.path.join(ROOT, ".github", "workflows", "seal.yml")
 
 # The steps this rehearses, by the name they carry in the workflow. A renamed step is a LookupError
@@ -101,15 +100,20 @@ def heredoc(script, tag="PY"):
 
 
 def run_python(script, env):
-    """Run a step's Python exactly as the runner does: a subprocess, cwd at the repo root (which is
-    what `sys.path.insert(0, "tools")` in those steps relies on). -> (exit code, everything it
-    printed)."""
+    """Run a step's Python exactly as the runner does: a subprocess, cwd at the repo root. ->
+    (exit code, everything it printed).
+
+    PYTHONPATH is this file's one departure from the runner. There, the step is `python - <<'PY'`,
+    so sys.path[0] is the cwd and `from phoenix_tooling import ...` resolves out of the checkout;
+    here the same text is written to a temp FILE, which puts the temp directory on sys.path
+    instead. Naming the root explicitly is what keeps the script itself byte-for-byte the one the
+    runner executes."""
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "step.py")
         with open(path, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(script)
         p = subprocess.run([sys.executable, path], cwd=ROOT, capture_output=True,
-                           env={**os.environ, **env})
+                           env={**os.environ, "PYTHONPATH": ROOT, **env})
     return p.returncode, (p.stdout + p.stderr).decode("utf-8", "replace")
 
 
@@ -139,7 +143,7 @@ def wire(doc):
 
 
 def manifest_bytes(payload_id="mod", serial=2_000_042, version="1.0.0"):
-    """A real payload manifest, built the only way one can be (tools/build_manifest.py)."""
+    """A real payload manifest, built the only way one can be (phoenix_tooling/build_manifest.py)."""
     e = build_manifest.entry("game/dota/a.bin", "a" * 64, 10, name="a.bin")
     return wire(build_manifest.build(payload_id, version, serial, [e]))
 
@@ -355,14 +359,15 @@ def _selftest():
     return bad
 
 
-def main():
+def main(argv=None):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    if len(sys.argv) == 2 and sys.argv[1] == "selftest":
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if len(argv) == 1 and argv[0] == "selftest":
         try:
             sys.exit(1 if _selftest() else 0)
         except RehearsalError as e:
             sys.exit(f"seal-rehearsal: {e}")
-    sys.exit("usage: python tools/seal_rehearsal.py selftest")
+    sys.exit("usage: phx rehearsal selftest")
 
 
 if __name__ == "__main__":

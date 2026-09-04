@@ -88,9 +88,9 @@ class Enum:
 
     Python's `bool` is a subtype of `int` (`True == 1`), so a same-value check alone would let a
     boolean slip through an int enum and vice versa -- the identical trap `schema`/`serial` guard
-    against elsewhere in this format (see tools/manifest_schema.py's old validator, now folded into
-    Int below). Matching type as well is what lets this ALSO serve as the boolean field type: a
-    toggle's `default` is `Enum(True, False)`, and nothing else is needed for it."""
+    against elsewhere in this format (see phoenix_tooling/manifest_schema.py's old validator, now
+    folded into Int below). Matching type as well is what lets this ALSO serve as the boolean
+    field type: a toggle's `default` is `Enum(True, False)`, and nothing else is needed for it."""
     def __init__(self, *values):
         self.values = values
 
@@ -133,9 +133,9 @@ class AssetName:
     (spaces and non-ASCII become something else), and the manifest keeps the name that was asked
     for -- so the entry then points at an asset that does not exist, on a release that uploaded
     fine. `tools/build_game_bundles.py` carries a whole `asset_name()` sanitizer for exactly this,
-    minting `[A-Za-z0-9._-]`; tools/phxb.py's bundle names (`<label>-<psha[:12]>.phxb`) already
-    live in the same set. This is that rule stated where the format is, so a producer that does not
-    sanitize cannot ship a name only GitHub gets to see the real version of."""
+    minting `[A-Za-z0-9._-]`; phoenix_tooling/phxb.py's bundle names (`<label>-<psha[:12]>.phxb`)
+    already live in the same set. This is that rule stated where the format is, so a producer that
+    does not sanitize cannot ship a name only GitHub gets to see the real version of."""
     _OK = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
 
     def render(self, value):
@@ -161,7 +161,7 @@ class Hex64:
 class Dest:
     """An install path: relative to the game root, always forward-slashed, never escaping it.
 
-    Ports every rule tools/validate_manifest.py's `unsafe_dest` used to check -- empty/non-string,
+    Ports every rule validate_manifest.py's `unsafe_dest` used to check -- empty/non-string,
     backslash, absolute (leading `/`), `..` traversal -- as something a caller CANNOT construct
     rather than something caught afterwards. Two rules are WIDER than that ported original:
 

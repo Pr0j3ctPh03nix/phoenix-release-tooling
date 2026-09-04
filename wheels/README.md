@@ -1,8 +1,8 @@
 # wheels/ — the offline install set for this repo's two non-stdlib dependencies
 
-`cryptography` (imported by `tools/phoenix_minisign.py`) and `zstandard` (imported by
-`tools/phxb.py`), plus the closure `cryptography` pulls in (`cffi` → `pycparser`), vendored as
-wheels so a producer installs them with
+`cryptography` (imported by `phoenix_tooling/minisign.py`) and `zstandard` (imported by
+`phoenix_tooling/phxb.py`), plus the closure `cryptography` pulls in (`cffi` → `pycparser`),
+vendored as wheels so a producer installs them with
 
     python -m pip install --disable-pip-version-check --no-index --find-links <checkout>/wheels cryptography [zstandard]
 
@@ -50,14 +50,14 @@ Once per platform, into this directory, then confirm and record:
         --platform manylinux_2_17_x86_64 --platform manylinux2014_x86_64 \
         -d wheels cryptography==<version> zstandard==<version>
 
-    python tools/wheels_check.py write        # cross-checks PyPI, then writes SHA256SUMS
-    python tools/phoenix_minisign.py selftest # the signer, against what was just vendored
+    python phx.py wheels write        # cross-checks PyPI, then writes SHA256SUMS
+    python phx.py minisign selftest   # the signer, against what was just vendored
 
 Delete the superseded files first — nothing prunes them, and a stale wheel left beside a new one is
 a version pip is free to pick.
 
 **No file is committed here whose sha256 was not cross-checked against
 `https://pypi.org/pypi/<package>/<version>/json`.** A local `pip download` proves only that some
-index answered on the day it ran. `tools/wheels_check.py write` performs that cross-check and
-refuses to record a digest it could not confirm; `tools/wheels_check.py check` re-proves the
-directory against `SHA256SUMS` offline, at any pinned SHA.
+index answered on the day it ran. `phx.py wheels write` performs that cross-check and refuses
+to record a digest it could not confirm; `phx.py wheels check` re-proves the directory
+against `SHA256SUMS` offline, at any pinned SHA.

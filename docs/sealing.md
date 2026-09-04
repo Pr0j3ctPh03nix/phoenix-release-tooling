@@ -80,7 +80,7 @@ covers bytes, so a re-serialisation on either side is a signature over a file no
 
 Which repository may seal which payload line is a fixed map in the workflow. A request naming a line
 its repository is not listed for is refused; so is a manifest this repo's own builder would not have
-produced (`python tools/build_manifest.py validate <manifest.json>` asks the same question locally,
+produced (`python phx.py manifest validate <manifest.json>` asks the same question locally,
 before dispatching).
 
 ## The answer
@@ -113,7 +113,7 @@ serial = max(highest sealed serial for this payload, serial in the latest publis
 ```sh
 git -C .tooling fetch --quiet origin sealed
 git -C .tooling worktree add --quiet "$RUNNER_TEMP/ledger" FETCH_HEAD     # or: git clone -b sealed
-sealed=$(python .tooling/tools/ping.py ledger --payload mod --sealed "$RUNNER_TEMP/ledger")
+sealed=$(python .tooling/phx.py ping ledger --payload mod --sealed "$RUNNER_TEMP/ledger")
 ```
 
 **`published + 1` alone is no longer safe.** Sealing and publishing are no longer the same job: a
@@ -141,9 +141,9 @@ used to run in the producer's job, and it is the check that catches a signature 
 clients do not pin — whose only symptom otherwise is an update channel that has quietly died:
 
 ```sh
-python .tooling/tools/phoenix_minisign.py verify staging/manifest.json \
+python .tooling/phx.py minisign verify staging/manifest.json \
     --pub .tooling/keys/phoenix-active.pub --sig staging/manifest.json.minisig
-python .tooling/tools/ping.py verify staging/ping.json --pub .tooling/keys/phoenix-active.pub
+python .tooling/phx.py ping verify staging/ping.json --pub .tooling/keys/phoenix-active.pub
 ```
 
 Also confirm the fetched `ping.json` carries **the serial you built with**. It is possible to fetch
@@ -157,7 +157,7 @@ needs; the release must not become visible without it.
 mirror will immediately try to fetch:
 
 ```sh
-python .tooling/tools/notify_mirrors.py notify --ping-file staging/ping.json
+python .tooling/phx.py notify notify --ping-file staging/ping.json
 ```
 
 ## The mirror registry, which seals a document that is not a manifest
@@ -179,20 +179,20 @@ The flow is the one above, with its own names:
 
 1. build the list, and **upload it to a DRAFT release** — `mirrors.json`, tagged `v<serial>`;
 2. the serial is `max(the ledger's highest sealed **mirrors** serial, the published one) + 1`
-   (`python .tooling/tools/ping.py ledger --payload mirrors --sealed <ledger>`); the published side
+   (`python .tooling/phx.py ping ledger --payload mirrors --sealed <ledger>`); the published side
    is the `serial` in the latest release's `mirrors.json`, exactly as for a payload — a tag that
    was never sealed spent nothing, and one that was is in the ledger;
 3. dispatch, with `trusted_comment` naming the list, e.g. `phoenix mirror list v2`;
 4. wait for `sealed/Pr0j3ctPh03nix/phoenix-mirror-registry/<tag>/{mirrors.json.minisig,ping.json}`;
-5. prove it locally — `phoenix_minisign.py verify mirrors.json --pub .tooling/keys/phoenix-active.pub
+5. prove it locally — `phx.py minisign verify mirrors.json --pub .tooling/keys/phoenix-active.pub
    --sig mirrors.json.minisig` — and confirm the ping's serial is the one in the document;
 6. upload `mirrors.json.minisig` to the draft, then undraft.
 
 There is no step 7: the ping minted for a mirror list is never delivered. A mirror's registry entry
 lists the payload *trees* it serves (`mod`, `launcher`, `game`) and never the list itself, so
-`notify_mirrors.py` would find no carrier and a mirror would answer `/sync/mirrors` with a 404. It
+`phx.py notify` would find no carrier and a mirror would answer `/sync/mirrors` with a 404. It
 is minted anyway so that every ledger entry is the same two files — `ping.json` is where
-`tools/ping.py` reads a sealed serial from, and a kind that skipped it would be a kind the ratchet
+`phx.py ping` reads a sealed serial from, and a kind that skipped it would be a kind the ratchet
 cannot see.
 
 ## The dispatch PAT
@@ -258,8 +258,8 @@ with a serial above the ledger is a fresh, legal attempt.
   see `client-dist-staging/docs/release-keys.md`. It never dispatched anything and still does not.
   Whoever publishes it is the authority for that release and mints its ping themselves —
   `build_game_bundles.py` (in `client-dist-staging`) does it after the upload, with the same key it
-  sealed with, and delivers it through `notify_mirrors.py`. By hand, the same two steps are
-  `python tools/ping.py sign --sec active.key --payload game --serial <the sealed serial> --out
-  ping.json`, then `notify_mirrors.py notify --ping-file ping.json --strict`.
+  sealed with, and delivers it through `phx.py notify`. By hand, the same two steps are
+  `python phx.py ping sign --sec active.key --payload game --serial <the sealed serial> --out
+  ping.json`, then `phx.py notify notify --ping-file ping.json --strict`.
 * **A recovery release** (`phoenix-recovery.pub`) is by hand by construction: RECOVERY never enters
   CI, here or anywhere.

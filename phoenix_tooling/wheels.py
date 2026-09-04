@@ -5,8 +5,8 @@
 release signing key — so the wheels ARE the code the key is handed to, and this repo is the only
 thing standing between them and that job. See wheels/README.md.
 
-    python tools/wheels_check.py check   # offline: the .whl files against wheels/SHA256SUMS
-    python tools/wheels_check.py write   # cross-check every file against PyPI, THEN write SHA256SUMS
+    python phx.py wheels check   # offline: the .whl files against wheels/SHA256SUMS
+    python phx.py wheels write   # cross-check every file against PyPI, THEN write SHA256SUMS
 
 TWO COMMANDS, AND THE SPLIT IS THE POINT. `check` never reaches the network, so it is runnable in a
 producer's CI at the pinned SHA, offline, for the same reason the install itself is. `write` reaches
@@ -27,7 +27,9 @@ import os
 import sys
 import urllib.request
 
-WHEELS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "wheels")
+from ._paths import ROOT
+
+WHEELS = os.path.join(ROOT, "wheels")
 SUMS = os.path.join(WHEELS, "SHA256SUMS")
 PYPI = "https://pypi.org/pypi/{}/{}/json"
 
@@ -146,12 +148,13 @@ def write():
     return 0
 
 
-def main():
+def main(argv=None):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    argv = sys.argv[1:] if argv is None else list(argv)
     cmds = {"check": check, "write": write}
-    if len(sys.argv) == 2 and sys.argv[1] in cmds:
-        sys.exit(1 if cmds[sys.argv[1]]() else 0)
-    sys.exit("usage: python tools/wheels_check.py {check|write}")
+    if len(argv) == 1 and argv[0] in cmds:
+        sys.exit(1 if cmds[argv[0]]() else 0)
+    sys.exit("usage: phx wheels {check|write}")
 
 
 if __name__ == "__main__":

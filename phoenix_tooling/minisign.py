@@ -35,13 +35,13 @@ Deliberate narrowings of upstream minisign, which any second implementation has 
     passphrase no human ever types is just a second secret stored beside the first.
 
 Needs `cryptography` — the only non-stdlib dependency in this repo's tooling, and only here; the
-document-only path (manifest_schema.py, build_manifest.py) must never pull it in. The `minisign`
-CLI is not used and does not have to exist.
+document-only path (manifest_schema.py, build_manifest.py) must never pull it in. The upstream
+`minisign` CLI is not used and does not have to exist.
 
-    python tools/phoenix_minisign.py keygen --sec phoenix.key --pub phoenix.pub
-    python tools/phoenix_minisign.py sign --sec phoenix.key manifest.json
-    python tools/phoenix_minisign.py verify --pub phoenix.pub manifest.json
-    python tools/phoenix_minisign.py selftest
+    python phx.py minisign keygen --sec phoenix.key --pub phoenix.pub
+    python phx.py minisign sign --sec phoenix.key manifest.json
+    python phx.py minisign verify --pub phoenix.pub manifest.json
+    python phx.py minisign selftest
 """
 import argparse
 import base64
@@ -395,9 +395,9 @@ def _write_new(path, text, what):
         f.write(text)
 
 
-def main():
+def main(argv=None):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap = argparse.ArgumentParser(prog="phx minisign", description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     g = sub.add_parser("keygen", help="mint a keypair; the secret is written, never printed")
@@ -419,7 +419,7 @@ def main():
     v.add_argument("--sig", help="default: <file>.minisig")
 
     sub.add_parser("selftest", help="check the signing and verification rules against each other")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
 
     if a.cmd == "selftest":
         sys.exit(1 if _selftest() else 0)

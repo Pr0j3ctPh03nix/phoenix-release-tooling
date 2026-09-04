@@ -14,8 +14,8 @@ name: seal
 #                 "trusted_comment": "phoenix mod v1.2.3"}}
 #
 # `manifest` is that field's name whatever KIND of document it carries — a payload manifest or the
-# mirror list — for the same reason tools/seal.py's flag is called `--manifest`: what gets signed is
-# a FILE's exact bytes, and the signer reads nothing inside them.
+# mirror list — for the same reason phoenix_tooling/seal.py's flag is called `--manifest`: what
+# gets signed is a FILE's exact bytes, and the signer reads nothing inside them.
 #
 # THE ANSWER, on branch `sealed`, which anybody may read:
 #
@@ -35,8 +35,9 @@ name: seal
 #      else is read (see that step: a dispatcher chooses the ref, a `repository_dispatch` could
 #      not);
 #   1. decode and authorize   — a repo may only seal the payload line it is listed for, below;
-#   2. VALIDATE the document  — a manifest is rebuilt by tools/build_manifest.py and the result must
-#      equal what was sent; a mirror list is held to its own narrow rules (see `read_mirrors`).
+#   2. VALIDATE the document  — a manifest is rebuilt by phoenix_tooling/build_manifest.py and
+#      the result must equal what was sent; a mirror list is held to its own narrow rules (see
+#      `read_mirrors`).
 #      Without this the job is an oracle that signs arbitrary bytes with the one key that also seals
 #      the launcher, the base game and the mirror list, and a signature over attacker-chosen bytes
 #      is not a smaller problem than a leaked key;
@@ -195,9 +196,7 @@ jobs:
           mkdir -p "$WORK"
           python - <<'PY'
           import base64, gzip, io, json, os, re, sys
-          sys.path.insert(0, "tools")
-          import build_manifest
-          import ping
+          from phoenix_tooling import build_manifest, ping
 
           ALLOWED = {
               "Pr0j3ctPh03nix/client-dist-staging":     "mod",
@@ -339,8 +338,7 @@ jobs:
           set -euo pipefail
           python - <<'PY'
           import os, sys
-          sys.path.insert(0, "tools")
-          import ping
+          from phoenix_tooling import ping
 
           payload, serial = os.environ["PAYLOAD_ID"], int(os.environ["SERIAL"])
           high = ping.ledger_high(os.environ["LEDGER"], payload)
@@ -364,18 +362,18 @@ jobs:
         run: python -m pip install --disable-pip-version-check --no-index --find-links wheels cryptography
 
       # Sign the document's exact bytes and prove the signature against the public half clients
-      # pin (tools/seal.py — the ORDER of those two is the whole point), then sign the mirror ping
-      # for the same serial and prove that too. Both are the same key and both fail the same way if
-      # it is ever rotated without republishing keys/: perfectly valid signatures nobody accepts,
-      # whose only symptom is an update channel that has quietly stopped existing.
+      # pin (phoenix_tooling/seal.py — the ORDER of those two is the whole point), then sign the
+      # mirror ping for the same serial and prove that too. Both are the same key and both fail
+      # the same way if it is ever rotated without republishing keys/: perfectly valid signatures
+      # nobody accepts, whose only symptom is an update channel that has quietly stopped existing.
       #
       # A PING IS MINTED FOR EVERY KIND, including `mirrors`, which no mirror will ever be told
       # about — a mirror's registry entry lists the payload trees it serves (mod/launcher/game) and
-      # never the list itself, so notify_mirrors.py finds no carrier and the registry does not even
-      # call it. It is minted anyway because it makes every ledger entry the same two files, and
-      # `ping.json` is where tools/ping.py's ledger reads a serial from: a kind that skipped it
-      # would be a kind the ratchet cannot see. `[a-z]+` is the whole of what a ping's payload has
-      # to satisfy, and `mirrors` satisfies it.
+      # never the list itself, so phoenix_tooling/notify.py finds no carrier and the registry does
+      # not even call it. It is minted anyway because it makes every ledger entry the same two
+      # files, and `ping.json` is where phoenix_tooling/ping.py's ledger reads a serial from: a
+      # kind that skipped it would be a kind the ratchet cannot see. `[a-z]+` is the whole of what
+      # a ping's payload has to satisfy, and `mirrors` satisfies it.
       - name: Seal the document and sign its ping
         env:
           PHOENIX_SIGNING_KEY: ${{ secrets.PHOENIX_SIGNING_KEY }}
@@ -386,18 +384,18 @@ jobs:
             echo "Every producer is now waiting on a signature nobody can make."
             exit 1
           }
-          python tools/seal.py seal \
+          python phx.py seal seal \
             --manifest "$WORK/$DOC" \
             --pub      keys/phoenix-active.pub \
             --trusted-comment "$TRUSTED_COMMENT"
-          python tools/ping.py sign \
+          python phx.py ping sign \
             --payload "$PAYLOAD_ID" --serial "$SERIAL" --out "$WORK/ping.json"
-          python tools/ping.py verify "$WORK/ping.json" --pub keys/phoenix-active.pub
+          python phx.py ping verify "$WORK/ping.json" --pub keys/phoenix-active.pub
           ls -l "$WORK"
 
       # THE ANSWER, and the ledger entry, in ONE commit: the two files are written together because
-      # tools/ping.py refuses a tag directory carrying only one of them — a half-written entry would
-      # make every later ratchet read fail rather than merely be incomplete.
+      # phoenix_tooling/ping.py refuses a tag directory carrying only one of them — a half-written
+      # entry would make every later ratchet read fail rather than merely be incomplete.
       #
       # The push is retried on a non-fast-forward. `concurrency` above should make that impossible,
       # but the cost of being wrong is a producer waiting ten minutes for a file that was signed and

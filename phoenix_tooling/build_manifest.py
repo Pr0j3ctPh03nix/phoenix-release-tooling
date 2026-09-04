@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build a manifest document by walking manifest_schema.MANIFEST -- the one producer path.
 
-Replaces "build a dict by hand, then run tools/validate_manifest.py over it afterwards" (deleted
+Replaces "build a dict by hand, then run validate_manifest.py over it afterwards" (deleted
 alongside this). That split let the two drift: a producer bug and a validator bug could agree with
 each other and nothing would notice. Here there is only one path to a document -- `build()` -- and
 it cannot return one that violates the format, because most of what the old validator checked is no
@@ -21,7 +21,7 @@ hand-typed there.
     doc = build("mod", "1.0.0", 2_000_007, entries, bundles=[bundle])
 
 Structural consequences worth spelling out, because each one replaces a rule
-tools/validate_manifest.py used to check AFTER the fact:
+validate_manifest.py used to check AFTER the fact:
 
   * `Bundle(...)` refuses to construct empty (B7), with a zero-size member (B6), with the same
     OBJECT already in another bundle, or with a member that is also a named/loose entry -- an entry
@@ -46,17 +46,16 @@ tools/validate_manifest.py used to check AFTER the fact:
 
 B4 -- "nothing between members, nothing after the last" -- has no producer-side equivalent; it is a
 property of the DECODED bundle stream, checkable only by something that decodes one, which nothing
-here does. It was absent from tools/validate_manifest.py for the identical reason.
+here does. It was absent from validate_manifest.py for the identical reason.
 
-    python tools/build_manifest.py selftest
+    python phx.py manifest selftest
 """
 import json
 import os
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import manifest_schema as schema  # noqa: E402
+from . import manifest_schema as schema
 
 
 # --- input objects: what a caller actually constructs ---------------------------------------------
@@ -104,10 +103,10 @@ class Variant(Asset):
 
 class Bundle:
     """One `.phxb` asset. `psize`/`psha256`/`codec` describe the packed bytes (produced by
-    tools/phxb.py, elsewhere -- this module never compresses anything); `entries` are the Asset
-    objects it packs, in the order the stream was written. `size` and `members` on the wire are
-    DERIVED from `entries` -- see manifest_schema.BUNDLE -- so this constructor is the only place
-    B5/B6/B7 can be violated, and it refuses all three outright."""
+    phoenix_tooling/phxb.py, elsewhere -- this module never compresses anything); `entries` are
+    the Asset objects it packs, in the order the stream was written. `size` and `members` on the
+    wire are DERIVED from `entries` -- see manifest_schema.BUNDLE -- so this constructor is the
+    only place B5/B6/B7 can be violated, and it refuses all three outright."""
     def __init__(self, name, codec, psize, psha256, entries):
         entries = list(entries)
         if not entries:
@@ -238,7 +237,7 @@ def _option_assets(option):
 
 def _asset_pool(entries, options):
     """Every Asset the document could legally bundle: top-level entries, plus every choice's
-    variants and every toggle's files. Mirrors tools/validate_manifest.py's old `entries()`.
+    variants and every toggle's files. Mirrors validate_manifest.py's old `entries()`.
 
     Built ONCE per build() and passed down, together with the id() index below: it used to be
     rebuilt for each of the two checks that need it, and `e not in pool` scanned it per bundle
@@ -440,7 +439,7 @@ def write(path, payload_id, version, serial, entries, bundles=(), options=(), tr
 # whatever it is sent, with the one key every payload -- and the mirror list -- is trusted under.
 #
 # So the check is back, and it is deliberately NOT a second implementation of the format. The
-# deleted tools/validate_manifest.py was a hand-written copy of the rules, free to drift from the
+# deleted validate_manifest.py was a hand-written copy of the rules, free to drift from the
 # producer's (manifest_schema.py's own docstring records the pair of PAYLOAD_IDS sets that did
 # exactly that). This instead REBUILDS: load the objects the document says it was built from, run
 # the one builder over them, and require the result to equal the document. Every rule is then
@@ -618,8 +617,8 @@ def validate(doc):
     a legal manifest that a builder could have written, its derived fields really follow from its
     contents, and it carries nothing else. It says nothing about whether the hashes name real
     bytes, nor whether the serial is the right one -- that second question is the ledger's (see
-    tools/ping.py's ledger_high), and it is the reason the authority reads `serial` from the
-    document rather than from whoever asked for a signature."""
+    phoenix_tooling/ping.py's ledger_high), and it is the reason the authority reads `serial` from
+    the document rather than from whoever asked for a signature."""
     rebuilt = build(**load(doc))
     # `signed_at` is the ONE field a rebuild cannot re-derive: manifest_schema declares it Derived
     # from an attribute the builder is handed (the clock is not this format's to read), so whatever
@@ -854,7 +853,7 @@ def _selftest():
 
     def serial_is_bool():
         # Python's bool is an int subclass (True == 1), so a check comparing only VALUE would let
-        # this through the minimum (`True >= 0`) -- the same trap tools/validate_manifest.py named
+        # this through the minimum (`True >= 0`) -- the same trap validate_manifest.py named
         # explicitly for `schema`/`serial`. Int.render() checks isinstance(..., bool) first.
         e = entry("game/dota/a.bin", sha("a"), 10, name="a.bin")
         build("mod", "1.0.0", True, [e])
@@ -1287,24 +1286,25 @@ def _selftest():
     return bad
 
 
-def main():
+def main(argv=None):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    if len(sys.argv) == 2 and sys.argv[1] == "selftest":
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if len(argv) == 1 and argv[0] == "selftest":
         sys.exit(1 if _selftest() else 0)
     # `validate` is a CLI because two callers outside this module want it: the sealing workflow,
     # which refuses a dispatched document before the key is read, and a producer, which can ask the
     # same question of its own manifest before dispatching anything.
-    if len(sys.argv) == 3 and sys.argv[1] == "validate":
-        with open(sys.argv[2], "rb") as fh:
+    if len(argv) == 2 and argv[0] == "validate":
+        with open(argv[1], "rb") as fh:
             raw = fh.read()
         try:
             doc = validate(parse(raw))
         except (ValueError, TypeError) as e:
-            sys.exit(f"REFUSED {sys.argv[2]}\n  {e}")
-        print(f"ok {sys.argv[2]} — schema {doc['schema']}, payload {doc['payload_id']}, "
+            sys.exit(f"REFUSED {argv[1]}\n  {e}")
+        print(f"ok {argv[1]} — schema {doc['schema']}, payload {doc['payload_id']}, "
               f"serial {doc['serial']}, {len(doc['files'])} file(s)")
         return
-    sys.exit("usage: python tools/build_manifest.py selftest | validate <manifest.json>")
+    sys.exit("usage: phx manifest selftest | validate <manifest.json>")
 
 
 if __name__ == "__main__":
