@@ -6,6 +6,7 @@
     python phx.py seal      seal --manifest ... --pub ... --trusted-comment ...
     python phx.py ping      sign | verify | ledger | selftest
     python phx.py notify    notify --ping-file ping.json
+    python phx.py dispatch  send | await | selftest
     python phx.py wheels    check | write
     python phx.py rehearsal selftest
     python phx.py selftest              # every module's selftest, in order
@@ -21,9 +22,9 @@ to be spelled, defaulted or documented. `phxb` is absent because it has no CLI: 
 WRITER, called by the two producers as a library.
 
 Modules are imported ONE AT A TIME, when routed to. `minisign` (and `seal`, through it) needs
-`cryptography` and `phxb` needs `zstandard`, while `ping`, `notify` and `manifest` run in producer
-CI before any wheel is installed — importing the table eagerly would make every command need what
-one of them needs.
+`cryptography` and `phxb` needs `zstandard`, while `ping`, `notify`, `dispatch` and `manifest` run
+in producer CI before any wheel is installed — importing the table eagerly would make every command
+need what one of them needs.
 """
 import importlib
 import sys
@@ -36,14 +37,15 @@ MODULES = {
     "seal": "seal",
     "ping": "ping",
     "notify": "notify",
+    "dispatch": "dispatch",
     "wheels": "wheels",
     "rehearsal": "rehearsal",
 }
 
 # The modules that carry a `selftest` subcommand, in dependency order: the format before the
-# builder that walks it, the signer before the ping that borrows its keys, and the rehearsal last
-# because it drives the real workflow through both.
-SELFTESTS = ("manifest", "minisign", "ping", "notify", "rehearsal")
+# builder that walks it, the signer before the ping that borrows its keys, the two that only speak
+# to the outside world after both, and the rehearsal last because it drives the real workflow.
+SELFTESTS = ("manifest", "minisign", "ping", "notify", "dispatch", "rehearsal")
 
 USAGE = ("usage: phx {" + " | ".join(MODULES) + " | selftest} ...\n"
          "       phx <module> --help  for one module's own arguments")
