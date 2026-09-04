@@ -59,9 +59,15 @@ print(json.dumps({"ref": "main", "inputs": {
     "trusted_comment": "phoenix mod v1.2.3"}}))
 PY
 gh api --method POST \
-  /repos/Pr0j3ctPh03nix/phoenix-release-tooling/actions/workflows/seal.yml/dispatches \
+  repos/Pr0j3ctPh03nix/phoenix-release-tooling/actions/workflows/seal.yml/dispatches \
   --input "$RUNNER_TEMP/request.json"
 ```
+
+**No leading slash on the endpoint.** Two of the three producers run this step under `shell: bash`
+on a *Windows* runner, where bash is MSYS and rewrites any argument that looks like an absolute Unix
+path into a Windows one: `/repos/…` reaches gh as `C:/Program Files/Git/repos/…`, which is refused
+as an invalid endpoint — after the draft release is already up. gh accepts the path without the
+slash on every platform, so write it that way rather than remembering which runner this is.
 
 Never `gh api -f manifest=...`: that puts the whole base64 blob in the process's argv, and a Windows
 runner's command line is capped at about 32,000 characters — a document well inside GitHub's own
