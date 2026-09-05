@@ -1,0 +1,89 @@
+{
+  "schema": 2,
+  "payload_id": "mirrorapp",
+  "serial": 1,
+  "signed_at": 1788609550,
+  "version": "0.1.0",
+  "notes": "The first release of the mirror app as a signed payload of its own. Hosts on\n`self_update = true` install it on their next full pass; a `\"canary\"` host installs it the\nmoment this release's ping arrives. A host still on `false` keeps running its rsynced\ncheckout and is unaffected.\n\n#### Added\n- The app installs its own releases. `installSelf` verifies this manifest against the\n  release ring pinned in `trust.ts`, stages the files under `state/releases/<serial>/` and\n  stands down; `boot.ts` runs whichever release `state/current` names. One that cannot stay\n  up three times running is marked bad and backed out.\n- A per-client transfer cap, so one client cannot spend the month's budget: `client_cap`\n  times what this host carries, per rolling `client_window`. IPv4 per address, IPv6 per /64.\n- `mirrors` and `mirrorapp` pings are answered by every host, whatever its `payloads` lists.\n\n#### Changed\n- The server answers exactly the five paths sync writes and 404s everything else, so the\n  lock file, the transfer counter and anything else in the root are no longer downloadable.\n- The release key ring is pinned in the app rather than fetched at ping time.\n- Read tokens are one per private repo: `[tokens.read]` with an entry per repo.\n- The systemd unit sandboxes the service and its start limit is finally parsed.\n\n#### Fixed\n- A request whose Host is not a host no longer reaches Bun's development error page, which\n  disclosed the install path and a source excerpt.\n- The server refuses to start if the tree it serves contains `mirror.cfg`, the working\n  directory's `.env`, or the app itself.\n- A pinged pass now commits a release it can see that is newer than the tree, instead of\n  discarding it while it waits for the serial it was told about.\n- The token-table migration message no longer prints the token it is migrating.",
+  "files": [
+    {
+      "name": "mirror.ts",
+      "dest": "mirror.ts",
+      "sha256": "d2331850387440502ab8bae3b90943335bbfcae7b156a7d50b0900921f64943a",
+      "size": 30026
+    },
+    {
+      "name": "sync.ts",
+      "dest": "sync.ts",
+      "sha256": "fb14b2e47648ab81490b036aa764898ff86326a87fc8cd044d61100a59480d30",
+      "size": 15447
+    },
+    {
+      "name": "selfupdate.ts",
+      "dest": "selfupdate.ts",
+      "sha256": "d46fa0ba2c8497fe09bad32e41f67fbac2c7cbbe1cc5d25cb6c48aa306fffd4d",
+      "size": 8806
+    },
+    {
+      "name": "github.ts",
+      "dest": "github.ts",
+      "sha256": "148ce7c09c9136c1304c56520f3da2715607a26ab9dc5138dc051fb32f463da2",
+      "size": 3387
+    },
+    {
+      "name": "atomic.ts",
+      "dest": "atomic.ts",
+      "sha256": "0d5c18a42e3af92796e494a1873fa57de8786efff3206aeb90187075427ddb0e",
+      "size": 432
+    },
+    {
+      "name": "layout.ts",
+      "dest": "layout.ts",
+      "sha256": "79a89a6a9fd775abaa5fa90a603e064d343166b5e7b6bbe7d8b3a4a1152aded9",
+      "size": 2101
+    },
+    {
+      "name": "config.ts",
+      "dest": "config.ts",
+      "sha256": "f950398782cba1bc87a5a5cba2e736eb33d14ce16a6a5d945dda48758dba09d4",
+      "size": 12054
+    },
+    {
+      "name": "register.ts",
+      "dest": "register.ts",
+      "sha256": "7f6856689ad9e03bf924563106ce88f233fc8eb57f86b06fabbc1a680294af7b",
+      "size": 10838
+    },
+    {
+      "name": "budget.ts",
+      "dest": "budget.ts",
+      "sha256": "621507b10590aa2f93558d9ce6019f2e007fb11a7975b65d65fda9f2582b6246",
+      "size": 4195
+    },
+    {
+      "name": "clients.ts",
+      "dest": "clients.ts",
+      "sha256": "b1cbabc3be313a1eb8bf706eff40b605dfb7527341a01e567c6612d6395ebca9",
+      "size": 8966
+    },
+    {
+      "name": "serial.ts",
+      "dest": "serial.ts",
+      "sha256": "cf2f7215b45c7937c67e9a5ff56423e90f4023e0d197d12b40d1840d7bede195",
+      "size": 695
+    },
+    {
+      "name": "trust.ts",
+      "dest": "trust.ts",
+      "sha256": "764d38dc9f6e37ae375fe4cc1b31bdf1e2311f645f3736c7842e057bfb63f64e",
+      "size": 4587
+    },
+    {
+      "name": "package.json",
+      "dest": "package.json",
+      "sha256": "cb184d82436c71d903530a5ad57874b8480a36df24d46aabbd0fb7925aa528fc",
+      "size": 712
+    }
+  ],
+  "remove": []
+}
