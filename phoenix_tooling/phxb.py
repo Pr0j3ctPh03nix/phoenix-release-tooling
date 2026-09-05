@@ -7,19 +7,10 @@ counting bytes -- see phoenix_tooling/manifest_schema.py and phoenix_tooling/bui
 the producer side of that; the reader side lived in docs/manifest-reader-contract.md before that
 directory was deleted alongside the validator it supported (see git history).
 
-WHY THIS FILE EXISTS. The mod producer (`dist/tools/gen_manifest.py`) and the base-game producer
-(`tools/build_game_bundles.py`) both emit this format, and used to carry byte-identical copies of
-the settings and the writer below, kept in step by a comment asking that they be "kept deliberately
-IDENTICAL". Nothing enforced it. The three settings are not tuning knobs — they are wire-format
-commitments (see each) — so a divergence would not fail a test, it would ship bundles a reader
-refuses or a build that is no longer reproducible.
-
-The old justification for copying was that this file "cannot be imported from dist". That was never
-the rule: `sync.py` copies dev-side tools into `dist/tools/` precisely for tools CI has to RUN, and
-the rule it enforces is about UNRUNNABLE DEPENDENCIES — a module that reaches for `../research/src`
-cannot live on a CI box. This one reaches for nothing: stdlib plus `zstandard`, no path assumptions.
-So it ships through `sync.py`'s `DEV_TOOLS`, like the signer, and hand-edits to the dist copy are
-reverted by the next sync like every other mirrored file.
+The three settings below are not tuning knobs — they are wire-format commitments (see each): a
+divergence between producers would not fail a test, it would ship bundles a reader refuses or a
+build that is no longer reproducible. Both producers (`dist/tools/stage_payload.py`,
+`client-dist-staging/tools/build_game_bundles.py`) import this module from a tooling checkout.
 """
 import hashlib
 import os
