@@ -41,7 +41,7 @@ SCHEMA = 3
 # not extend the format, it would erase that line. (build_manifest.py's selftest asserts the
 # absence; the same set once lived hand-duplicated in validate_manifest.py and the two were free to
 # drift apart with nothing to notice -- see git history.)
-PAYLOAD_IDS = ("mod", "launcher", "game")
+PAYLOAD_IDS = ("mod", "launcher", "game", "mirrorapp")
 
 CODECS = ("zstd",)
 

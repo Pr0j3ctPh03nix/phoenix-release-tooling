@@ -445,7 +445,7 @@ def _selftest():
     # The two document names the sealing authority writes -- see SIG_SUFFIX. The ledger must read
     # both, which is why its rule is the suffix rather than either of these strings.
     ok("every payload line but the mirror list seals a manifest",
-       lambda: assert_({document_name(p) for p in ("mod", "launcher", "game")}
+       lambda: assert_({document_name(p) for p in ("mod", "launcher", "game", "mirrorapp")}
                        == {MANIFEST_DOCUMENT}, "a payload line seals something else"))
     ok("the mirror list seals under its own name",
        lambda: assert_(document_name(MIRRORS) == "mirrors.json", document_name(MIRRORS)))

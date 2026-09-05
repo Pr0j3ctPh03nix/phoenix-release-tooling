@@ -289,7 +289,7 @@ def _selftest():
 
     # --- 2. AUTHORIZATION IS BY SHAPE: one repo, one payload line --------------------------------
     ok("a repository that is on no list may ask for nothing",
-       lambda: refused(request("Pr0j3ctPh03nix/phoenix-mirror"), "may not ask"))
+       lambda: refused(request("Pr0j3ctPh03nix/game-dist"), "may not ask"))
     ok("a launcher manifest dispatched by the mod's repo is refused",
        lambda: refused(request("Pr0j3ctPh03nix/client-dist-staging",
                                manifest_bytes(payload_id="launcher")), "may seal payload_id"))
@@ -297,6 +297,13 @@ def _selftest():
        lambda: accepted(request("Pr0j3ctPh03nix/phoenix-launcher",
                                 manifest_bytes(payload_id="launcher")),
                         PAYLOAD_ID="launcher", DOC="manifest.json"))
+    ok("a mirrorapp manifest from the mirror app's own repo is accepted",
+       lambda: accepted(request("Pr0j3ctPh03nix/phoenix-mirror",
+                                manifest_bytes(payload_id="mirrorapp")),
+                        PAYLOAD_ID="mirrorapp", DOC="manifest.json"))
+    ok("a mod manifest dispatched by the mirror app's repo is refused",
+       lambda: refused(request("Pr0j3ctPh03nix/phoenix-mirror", manifest_bytes()),
+                       "may seal payload_id"))
 
     # --- 3. THE MIRROR REGISTRY, the one repo that may seal a document that is not a manifest ----
     ok("a valid mirrors.json from the registry is accepted, and sealed under its own name",
@@ -332,7 +339,7 @@ def _selftest():
     # Anti-rot: every repo the workflow authorizes has a case above. A line added to that map
     # without one here is a producer whose requests nothing ever rehearsed.
     covered = {"Pr0j3ctPh03nix/client-dist-staging", "Pr0j3ctPh03nix/phoenix-launcher",
-               "Pr0j3ctPh03nix/phoenix-mirror-registry"}
+               "Pr0j3ctPh03nix/phoenix-mirror", "Pr0j3ctPh03nix/phoenix-mirror-registry"}
     listed = set(re.findall(r'"(Pr0j3ctPh03nix/[\w.-]+)":\s*"', request_script))
     ok("every repository the authorization map names is exercised here",
        lambda: assert_(listed - covered == {"Pr0j3ctPh03nix/client-dist"},

@@ -215,9 +215,10 @@ jobs:
               "Pr0j3ctPh03nix/client-dist-staging":     "mod",
               "Pr0j3ctPh03nix/client-dist":             "mod",
               "Pr0j3ctPh03nix/phoenix-launcher":        "launcher",
+              "Pr0j3ctPh03nix/phoenix-mirror":          "mirrorapp",
               "Pr0j3ctPh03nix/phoenix-mirror-registry": "mirrors",
           }
-          # The mirror list is its own DOCUMENT KIND, not a fourth manifest: it has no files and no
+          # The mirror list is its own DOCUMENT KIND, not another manifest: it has no files and no
           # bundles, its format is the registry's generate_mirror_list.py, and `mirrors` is
           # deliberately not in manifest_schema.PAYLOAD_IDS. The two kinds are therefore sealed into
           # differently NAMED documents and signatures (ping.document_name, which the producer's
@@ -433,10 +434,7 @@ jobs:
       # the same way if it is ever rotated without republishing keys/: perfectly valid signatures
       # nobody accepts, whose only symptom is an update channel that has quietly stopped existing.
       #
-      # A PING IS MINTED FOR EVERY KIND, including `mirrors`, which today no mirror is told about —
-      # a mirror's registry entry lists the payload trees it serves (mod/launcher/game) and never
-      # the list itself, so when action.yml delivers this ping phoenix_tooling/notify.py finds no
-      # carrier. It is minted anyway because it makes every ledger entry the same three
+      # A PING IS MINTED FOR EVERY KIND, `mirrors` included: every ledger entry is the same three
       # files, and `ping.json` is where phoenix_tooling/ping.py's ledger reads a serial from: a
       # kind that skipped it would be a kind the counter cannot see. `[a-z]+` is the whole of what
       # a ping's payload has to satisfy, and `mirrors` satisfies it.
