@@ -2,6 +2,8 @@
 """The one CLI over `phoenix_tooling` — `phx <module> <the module's own arguments>`.
 
     python phx.py manifest  selftest | validate <manifest.json> | assign --serial N <request.json>
+                            | build --payload <id> --version <v> --out <manifest.json> <file>...
+    python phx.py phxb      selftest
     python phx.py minisign  keygen | sign | verify | selftest
     python phx.py seal      seal --manifest ... --pub ... --trusted-comment ...
     python phx.py ping      sign | verify | ledger | selftest
@@ -18,8 +20,7 @@ the contract, the layout underneath them is not.
 
 Routing is deliberately thin. Each module owns its own argument parsing, so this hands the rest of
 argv straight to that module's `main()` and does nothing else — there is no second place for a flag
-to be spelled, defaulted or documented. `phxb` is absent because it has no CLI: it is the bundle
-WRITER, called by the two producers as a library.
+to be spelled, defaulted or documented.
 
 Modules are imported ONE AT A TIME, when routed to. `minisign` (and `seal`, through it) needs
 `cryptography` and `phxb` needs `zstandard`, while `ping`, `notify`, `dispatch` and `manifest` run
@@ -33,6 +34,7 @@ import sys
 # `prog` says; it is the thing that must not change under a consumer.
 MODULES = {
     "manifest": "build_manifest",
+    "phxb": "phxb",
     "minisign": "minisign",
     "seal": "seal",
     "ping": "ping",
@@ -45,7 +47,7 @@ MODULES = {
 # The modules that carry a `selftest` subcommand, in dependency order: the format before the
 # builder that walks it, the signer before the ping that borrows its keys, the two that only speak
 # to the outside world after both, and the rehearsal last because it drives the real workflow.
-SELFTESTS = ("manifest", "minisign", "ping", "notify", "dispatch", "rehearsal")
+SELFTESTS = ("manifest", "phxb", "minisign", "ping", "notify", "dispatch", "rehearsal")
 
 USAGE = ("usage: phx {" + " | ".join(MODULES) + " | selftest} ...\n"
          "       phx <module> --help  for one module's own arguments")

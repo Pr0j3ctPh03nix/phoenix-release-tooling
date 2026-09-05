@@ -50,6 +50,8 @@ here does. It was absent from validate_manifest.py for the identical reason.
 
     python phx.py manifest selftest
 """
+import argparse
+import hashlib
 import json
 import os
 import sys
@@ -684,6 +686,82 @@ def assign(doc, serial):
     except ping.PingError as e:
         raise ValueError(f"{e} -- a seal assigns the serial a release is published at") from None
     return validate(dict(doc, serial=assigned))
+
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _dest_under(path, root):
+    try:
+        rel = os.path.relpath(os.path.abspath(path), os.path.abspath(root))
+    except ValueError:
+        rel = os.pardir
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep):
+        return None
+    return rel.replace(os.sep, "/")
+
+
+def _build_cli(argv):
+    ap = argparse.ArgumentParser(prog="phx manifest build")
+    ap.add_argument("--payload", required=True,
+                    help="which payload line this document belongs to: "
+                         + " | ".join(schema.PAYLOAD_IDS))
+    ap.add_argument("--version", required=True,
+                    help="the release version; one leading 'v' is stripped, so a tag works")
+    ap.add_argument("--out", required=True, help="the manifest.json to write")
+    ap.add_argument("--notes-file", metavar="MD",
+                    help="markdown whose text becomes the document's notes (the updater's "
+                         "What's new)")
+    ap.add_argument("--root", metavar="DIR",
+                    help="each file's dest is its path relative to DIR; without it, a dest is the "
+                         "file's own basename")
+    ap.add_argument("files", nargs="+", metavar="FILE",
+                    help="a file that ships as a release asset of its own")
+    a = ap.parse_args(argv)
+
+    if a.payload not in schema.PAYLOAD_IDS:
+        sys.exit(f"REFUSED --payload {a.payload!r}\n  the format defines "
+                 + " | ".join(schema.PAYLOAD_IDS))
+
+    notes = None
+    if a.notes_file:
+        with open(a.notes_file, encoding="utf-8-sig") as fh:
+            notes = fh.read().strip() or None
+
+    entries, first_seen = [], {}
+    for path in a.files:
+        if not os.path.isfile(path):
+            sys.exit(f"REFUSED {path}\n  not a file")
+        name = os.path.basename(path)
+        if name in first_seen:
+            sys.exit(f"REFUSED {path}\n  {first_seen[name]} already ships as the release asset "
+                     f"{name!r} -- one release, one file per name")
+        first_seen[name] = path
+        dest = name if a.root is None else _dest_under(path, a.root)
+        if dest is None:
+            sys.exit(f"REFUSED {path}\n  outside --root {a.root} -- a dest is where the file sits "
+                     "under the root, and this one sits nowhere under it")
+        entries.append(Entry(dest, _sha256(path), os.path.getsize(path), name=name))
+
+    version = a.version[1:] if a.version.startswith("v") else a.version
+    try:
+        doc = write(a.out, a.payload, version, entries=entries, notes=notes)
+    except (ValueError, TypeError) as e:
+        sys.exit(f"REFUSED {a.out}\n  {e}")
+    print(_summary(a.out, doc))
+
+
+def _summary(path, doc):
+    # A document at serial 0 is not half-written: it is what a producer sends the authority, and
+    # saying so here is what stops "serial 0" reading as a bug at the one moment it is checked.
+    serial = "serial 0 (a seal request)" if doc["serial"] == 0 else f"serial {doc['serial']}"
+    return (f"ok {path} — schema {doc['schema']}, payload {doc['payload_id']}, "
+            f"{serial}, {len(doc['files'])} file(s)")
 
 
 # --- selftest -----------------------------------------------------------------------------------
@@ -1400,6 +1478,119 @@ def _selftest():
     refused("assigning to a document this builder would not build",
             lambda: assign(dict(request(), remove=["game/dota/old.txt"]), 7))
 
+    def build_cli(*args):
+        import subprocess
+        phx = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "phx.py")
+        return subprocess.run([sys.executable, phx, "manifest", "build", *args],
+                              capture_output=True, encoding="utf-8", errors="replace")
+
+    def a_staged_file(root, rel, data):
+        path = os.path.join(root, rel.replace("/", os.sep))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(data)
+        return path
+
+    def tmp():
+        import tempfile
+        return tempfile.mkdtemp()
+
+    def read_doc(path):
+        with open(path, "rb") as fh:
+            return validate(parse(fh.read()))
+
+    def one_file_is_a_launcher_release():
+        d = tmp()
+        data = b"MZ\x90\x00 a launcher"
+        exe = a_staged_file(d, "staging/phoenix-launcher.exe", data)
+        out = os.path.join(d, "manifest.json")
+        p = build_cli("--payload", "launcher", "--version", "v1.2.3", "--out", out, exe)
+        assert_(p.returncode == 0, f"exit {p.returncode}: {p.stdout}{p.stderr}")
+        doc = read_doc(out)
+        assert_(doc["payload_id"] == "launcher", f"payload_id: {doc['payload_id']}")
+        assert_(doc["version"] == "1.2.3", f"one leading 'v' is stripped: {doc['version']}")
+        assert_(doc["serial"] == 0, "what this writes is a seal request")
+        assert_(doc["files"] == [{"name": "phoenix-launcher.exe", "dest": "phoenix-launcher.exe",
+                                  "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}],
+                f"files: {doc['files']}")
+        assert_(p.stdout.strip() == f"ok {out} — schema 2, payload launcher, "
+                                    "serial 0 (a seal request), 1 file(s)", f"stdout: {p.stdout!r}")
+
+    def root_makes_dests_relative():
+        d = tmp()
+        root = os.path.join(d, "staging")
+        deep = a_staged_file(root, "game/dota/cfg/phoenix.cfg", b"module.gc=0\n")
+        flat = a_staged_file(root, "winmm.dll", b"a proxy dll")
+        out = os.path.join(d, "manifest.json")
+        p = build_cli("--payload", "mod", "--version", "1.0.0", "--out", out, "--root", root,
+                      deep, flat)
+        assert_(p.returncode == 0, f"exit {p.returncode}: {p.stdout}{p.stderr}")
+        doc = read_doc(out)
+        assert_([f["dest"] for f in doc["files"]] == ["game/dota/cfg/phoenix.cfg", "winmm.dll"],
+                f"dests: {[f['dest'] for f in doc['files']]}")
+        assert_([f["name"] for f in doc["files"]] == ["phoenix.cfg", "winmm.dll"],
+                f"names: {[f['name'] for f in doc['files']]}")
+
+    def refuses(p, *named):
+        said = p.stdout + p.stderr
+        assert_(p.returncode != 0, f"ACCEPTED -- the check does not exist: {said}")
+        for token in named:
+            assert_(token in said, f"the refusal does not name {token!r}: {said!r}")
+
+    def notes_lose_their_bom():
+        d = tmp()
+        exe = a_staged_file(d, "staging/phoenix-launcher.exe", b"MZ")
+        notes = a_staged_file(d, "release_body.md",
+                              b"\xef\xbb\xbf### Added\n- Something visible.\n")
+        out = os.path.join(d, "manifest.json")
+        p = build_cli("--payload", "launcher", "--version", "v1.2.3", "--out", out,
+                      "--notes-file", notes, exe)
+        assert_(p.returncode == 0, f"exit {p.returncode}: {p.stdout}{p.stderr}")
+        doc = read_doc(out)
+        assert_(doc["notes"] == "### Added\n- Something visible.", f"notes: {doc['notes']!r}")
+
+    def a_file_outside_root():
+        d = tmp()
+        root = os.path.join(d, "staging")
+        os.makedirs(root)
+        stray = a_staged_file(d, "elsewhere/stray.txt", b"x")
+        refuses(build_cli("--payload", "mod", "--version", "1.0.0", "--out",
+                          os.path.join(d, "manifest.json"), "--root", root, stray),
+                stray, "--root")
+
+    def two_files_one_basename():
+        d = tmp()
+        root = os.path.join(d, "staging")
+        one = a_staged_file(root, "en/notes.txt", b"one")
+        two = a_staged_file(root, "ru/notes.txt", b"two")
+        refuses(build_cli("--payload", "mod", "--version", "1.0.0", "--out",
+                          os.path.join(d, "manifest.json"), "--root", root, one, two),
+                one, two)
+
+    def a_payload_outside_the_closed_set():
+        d = tmp()
+        refuses(build_cli("--payload", "skins", "--version", "1.0.0",
+                          "--out", os.path.join(d, "manifest.json"),
+                          a_staged_file(d, "a.bin", b"a")),
+                *schema.PAYLOAD_IDS)
+
+    def no_files_named_at_all():
+        d = tmp()
+        refuses(build_cli("--payload", "mod", "--version", "1.0.0",
+                          "--out", os.path.join(d, "manifest.json")), "usage")
+
+    ok("one file -> a document validate accepts, dest and name both the basename",
+       one_file_is_a_launcher_release)
+    ok("--root: every dest is the file's path under it, forward-slashed", root_makes_dests_relative)
+    ok("--notes-file: a BOM a PowerShell step wrote does not reach `notes`", notes_lose_their_bom)
+    ok("a file outside --root is REFUSED, naming it and the root", a_file_outside_root)
+    ok("two files whose basenames claim one release asset name are REFUSED, naming both",
+       two_files_one_basename)
+    ok("a payload id outside the closed set is REFUSED, listing the ids",
+       a_payload_outside_the_closed_set)
+    ok("no files at all is a usage error -- a manifest of nothing is not a release",
+       no_files_named_at_all)
+
     for good, name, detail in results:
         print(f"  {'ok  ' if good else 'FAIL'} {name}" + (f"\n         {detail}" if detail else ""))
     bad = sum(not good for good, _, _ in results)
@@ -1413,6 +1604,8 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
     if len(argv) == 1 and argv[0] == "selftest":
         sys.exit(1 if _selftest() else 0)
+    if argv and argv[0] == "build":
+        return _build_cli(argv[1:])
     # `validate` is a CLI because two callers outside this module want it: the sealing workflow,
     # which refuses a dispatched document before the key is read, and a producer, which can ask the
     # same question of its own manifest before dispatching anything.
@@ -1423,12 +1616,7 @@ def main(argv=None):
             doc = validate(parse(raw))
         except (ValueError, TypeError) as e:
             sys.exit(f"REFUSED {argv[1]}\n  {e}")
-        # A document at serial 0 is not half-written: it is what a producer sends the authority, and
-        # saying so here is what stops "serial 0" reading as a bug at the one moment it is checked.
-        serial = ("serial 0 (a seal request)" if doc["serial"] == 0
-                  else f"serial {doc['serial']}")
-        print(f"ok {argv[1]} — schema {doc['schema']}, payload {doc['payload_id']}, "
-              f"{serial}, {len(doc['files'])} file(s)")
+        print(_summary(argv[1], doc))
         return
     # `assign` is a CLI for the one release that cannot ask the authority to number it: a RECOVERY
     # release, sealed by hand under the recovery key (client-dist-staging/docs/release-keys.md).
@@ -1445,7 +1633,9 @@ def main(argv=None):
         print(f"ok {argv[3]} — assigned serial {doc['serial']}")
         return
     sys.exit("usage: phx manifest selftest | validate <manifest.json> | "
-             "assign --serial <N> <request.json>")
+             "assign --serial <N> <request.json> |\n"
+             "       phx manifest build --payload <id> --version <v> --out <manifest.json> "
+             "[--notes-file <md>] [--root <dir>] <file>...")
 
 
 if __name__ == "__main__":
