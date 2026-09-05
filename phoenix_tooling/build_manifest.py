@@ -1362,6 +1362,16 @@ def _selftest():
     refused("a payload_id outside the closed set, on the wire", lambda: as_sent(payload_id="skins"))
     refused("a serial that is not a whole number, on the wire", lambda: as_sent(serial="2000001"))
 
+    def the_mirror_app_is_a_payload_line():
+        e = entry("phoenix-mirror.exe", sha("mirrorapp"), 8912896, name="phoenix-mirror.exe")
+        doc = build("mirrorapp", "0.1.0", entries=[e])
+        assert_(doc["payload_id"] == "mirrorapp", f"payload_id: {doc['payload_id']}")
+        assert_(doc["serial"] == 0, "a build with no serial is a seal request")
+        assert_(validate(parse(render(doc))) == doc, "the document did not survive its own bytes")
+
+    ok("the mirror app is a payload line: loose files at serial 0, and it round-trips",
+       the_mirror_app_is_a_payload_line)
+
     # The mirror list is sealed by the same authority (.github/workflows/seal.yml) and is NOT a
     # manifest: it is checked by its own narrow rules and its signature is named after its own
     # document. Both directions of that line are asserted here, where the closed set lives -- a

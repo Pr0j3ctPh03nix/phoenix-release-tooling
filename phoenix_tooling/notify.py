@@ -26,7 +26,8 @@ payload was sealed — `--ping-file`, POSTed verbatim as the request body:
 
 The payload id comes out of that file, never from an argument, and only mirrors whose registry
 entry lists that payload are contacted at all: a mirror that carries the launcher and not the base
-game is not a mirror that failed to sync the base game, it is one the base game was never for.
+game is not a mirror that failed to sync the base game, it is one the base game was never for. The
+HOST_WIDE payloads below are the exception — every host carries them, whatever its entry lists.
 
 Mirrors pull from GitHub on a timer; this only says "now, and here is the serial". The endpoint is
 unauthenticated and rate-limited on the mirror's side — nothing here carries a credential, and a
@@ -94,6 +95,8 @@ CONTENT_TYPE = "application/json"
 # The only two schemes a list entry may name. See the header: this is the one rule that keeps a
 # published document from choosing what a key-holding runner connects to.
 SCHEMES = ("http", "https")
+
+HOST_WIDE = frozenset({ping.MIRRORS, "mirrorapp"})
 
 UA = "phoenix-notify-mirrors"
 TIMEOUT = 10.0
@@ -238,16 +241,21 @@ def post(url, body, retries, timeout, opener):
     return False, detail
 
 
+def carriers(mirrors, payload):
+    if payload in HOST_WIDE:
+        return list(mirrors)
+    return [m for m in mirrors if payload in m.payloads]
+
+
 def notify(mirrors, payload, body, retries, timeout):
-    """Every mirror that carries `payload`, in order, whatever the last one did. -> [Result].
+    """Every mirror this payload is delivered to (`carriers`), in order, whatever the last one did.
+    -> [Result].
 
     A mirror that does not carry it is not in the results at all — it is not a mirror that failed,
     and counting it as one would put a permanent red number beside every release."""
     opener = urllib.request.build_opener(_NoRedirect)
     results = []
-    for m in mirrors:
-        if payload not in m.payloads:
-            continue
+    for m in carriers(mirrors, payload):
         url = sync_url(m.base_url, payload)
         if url is None:
             results.append(Result(m.name, m.base_url, False, "refused: not an http(s) URL"))
@@ -296,7 +304,7 @@ def _fixture_server():
         def do_POST(self):
             body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
             self.server.seen.append((self.path, self.headers.get("Content-Type"), body))
-            if self.path == "/ok/sync/mod":
+            if self.path.startswith("/ok/sync/"):
                 code = 202                      # the mirror app's "syncing now"
             elif self.path == "/have/sync/mod":
                 code = 200                      # ...and its "already have that serial"
@@ -488,6 +496,34 @@ def _selftest():
                    "some.json", [("phx-l", base + "/ok", ["launcher"]),
                                  ("phx-m", base + "/ok", ["mod"])]))[1], "the count is wrong"))
 
+            def host_wide_ping(payload):
+                return write_ping(payload + "ping.json", {
+                    "payload": payload, "serial": "2000042",
+                    "key_id": "0011223344556677", "sig": "A" * 86 + "=="})
+
+            mod_only = write_list("modonly.json", [("phx-mod", base + "/ok", ["mod"])])
+            code, out = run(mod_only, ping_file=host_wide_ping(ping.MIRRORS))
+            ok("a `mirrors` ping reaches a mirror whose payloads names only mod",
+               lambda: assert_(code == 0 and len(lines(out)) == 1
+                               and lines(out)[0].startswith("  ok")
+                               and paths()[-1] == "/ok/sync/mirrors",
+                               "exit {}, out: {}".format(code, out)))
+            mirrors_out = out
+            code, out = run(mod_only, ping_file=host_wide_ping("mirrorapp"))
+            ok("a `mirrorapp` ping reaches it too — every host runs the app",
+               lambda: assert_(code == 0 and len(lines(out)) == 1
+                               and lines(out)[0].startswith("  ok")
+                               and paths()[-1] == "/ok/sync/mirrorapp",
+                               "exit {}, out: {}".format(code, out)))
+            ok("neither report counts that mirror as carrying no host-wide payload",
+               lambda: assert_("carry no" not in mirrors_out and "carry no" not in out,
+                               mirrors_out + out))
+            code, out = run(write_list("skips.json", [("phx-l", base + "/ok", ["launcher"]),
+                                                      ("phx-m", base + "/ok", ["mod"])]))
+            ok("a `mod` ping still skips a mirror that does not carry it, and the report says so",
+               lambda: assert_(code == 0 and len(lines(out)) == 1 and "1 carry no mod" in out,
+                               "exit {}, out: {}".format(code, out)))
+
             no_payloads = write_list("nopayloads.json", None, doc={
                 "format": 1, "serial": 7,
                 "mirrors": [{"base_url": base + "/ok", "name": "phx-old"}]})
@@ -610,7 +646,7 @@ def main(argv=None):
         # repo's problem rather than a host's.
         die(str(e))
 
-    carrying = [m for m in mirrors if payload in m.payloads]
+    carrying = carriers(mirrors, payload)
     print("notify: {} — list serial {}, {} mirror(s); pinging {} for {} serial {}".format(
         a.list_path or a.registry, doc.get("serial", "?"), len(mirrors), len(carrying),
         payload, pdoc["serial"]), file=sys.stderr)
